@@ -146,7 +146,7 @@ function generateQRUrl(data) {
   };
   const json = JSON.stringify(qd);
   
-  // This is EXACTLY how the quiz encodes it:
+  // Exact same encoding as quiz:
   // btoa(encodeURIComponent(json).replace(/%([0-9A-F]{2})/g, (match, p1) => String.fromCharCode('0x' + p1)))
   const encoded = encodeURIComponent(json);
   const replaced = encoded.replace(/%([0-9A-F]{2})/g, (match, p1) => String.fromCharCode(parseInt(p1, 16)));
@@ -164,9 +164,9 @@ async function generateLabelPDF(data) {
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const helveticaOblique = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
   
-  // Larger page for better readability (A6 size: 105mm x 148mm)
-  const pageWidth = 297.64;
-  const pageHeight = 419.53;
+  // Taller page to fit everything (105mm x 170mm)
+  const pageWidth = 297.64;   // 105mm
+  const pageHeight = 481.89;  // 170mm - taller to fit QR + Echtheit
   
   const black = rgb(0, 0, 0);
   const gray = rgb(0.5, 0.5, 0.5);
@@ -184,13 +184,13 @@ async function generateLabelPDF(data) {
   const concentration = data.concentration || 22;
 
   // ============================================================================
-  // PAGE 1: FRONT LABEL (Clean, Professional Design)
+  // PAGE 1: FRONT LABEL
   // ============================================================================
   const page1 = pdfDoc.addPage([pageWidth, pageHeight]);
   const centerX = pageWidth / 2;
   let y = pageHeight - 35;
 
-  // Batch number - top right corner
+  // Batch number - top right
   const batchNumText = `#${data.batch || '00000000'}`;
   page1.drawText(batchNumText, {
     x: pageWidth - 30 - helvetica.widthOfTextAtSize(batchNumText, 10),
@@ -202,7 +202,7 @@ async function generateLabelPDF(data) {
 
   y -= 50;
 
-  // IDENTÉ Logo - Large and Bold
+  // IDENTÉ Logo
   const logoText = 'IDENTE';
   const logoSize = 52;
   page1.drawText(logoText, {
@@ -213,9 +213,9 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 40;
+  y -= 45;
 
-  // "for [Name]" - Italic
+  // "for [Name]"
   const forText = `for ${data.name || 'Customer'}`;
   page1.drawText(forText, {
     x: centerX - helveticaOblique.widthOfTextAtSize(forText, 20) / 2,
@@ -225,9 +225,9 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 35;
+  y -= 38;
 
-  // "Eau de Parfum" - Italic
+  // "Eau de Parfum"
   const eauText = 'Eau de Parfum';
   page1.drawText(eauText, {
     x: centerX - helveticaOblique.widthOfTextAtSize(eauText, 16) / 2,
@@ -237,11 +237,11 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 55;
+  y -= 60;
 
-  // Large Concentration Percentage
+  // Large Concentration
   const concText = `${concentration}%`;
-  const concSize = 62;
+  const concSize = 65;
   page1.drawText(concText, {
     x: centerX - helveticaBold.widthOfTextAtSize(concText, concSize) / 2,
     y: y,
@@ -250,9 +250,9 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 35;
+  y -= 38;
 
-  // Specs line with dots
+  // Specs line
   const specsText = `${concentration}% \u00B7 50ml \u00B7 ${noteCount} Notes`;
   page1.drawText(specsText, {
     x: centerX - helvetica.widthOfTextAtSize(specsText, 13) / 2,
@@ -264,7 +264,7 @@ async function generateLabelPDF(data) {
 
   y -= 25;
 
-  // Horizontal divider line
+  // Horizontal line
   const lineMargin = 60;
   page1.drawLine({
     start: { x: lineMargin, y: y },
@@ -297,41 +297,37 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 45;
+  y -= 50;
 
-  // Bottom section with BATCH INFO (left) and QR Code (right)
-  const bottomY = y;
+  // BATCH INFO section (left side)
   const leftX = 35;
-  const qrX = pageWidth - 130;
+  const batchInfoY = y;
 
-  // BATCH INFO title
   page1.drawText('BATCH INFO', {
     x: leftX,
-    y: bottomY,
+    y: batchInfoY,
     size: 13,
     font: helveticaBold,
     color: black,
   });
 
-  // Batch number
   page1.drawText(`Batch: ${data.batch || 'N/A'}`, {
     x: leftX,
-    y: bottomY - 22,
+    y: batchInfoY - 22,
     size: 12,
     font: helvetica,
     color: black,
   });
 
-  // Date
   page1.drawText(`Date: ${data.date || 'N/A'}`, {
     x: leftX,
-    y: bottomY - 42,
+    y: batchInfoY - 42,
     size: 12,
     font: helvetica,
     color: black,
   });
 
-  // QR Code - using exact same encoding as quiz
+  // QR Code (right side)
   try {
     const qrUrl = generateQRUrl(data);
     console.log('📱 QR URL:', qrUrl);
@@ -346,19 +342,22 @@ async function generateLabelPDF(data) {
     const qrImageData = qrDataUrl.replace(/^data:image\/png;base64,/, '');
     const qrImage = await pdfDoc.embedPng(Buffer.from(qrImageData, 'base64'));
     
-    const qrSize = 90;
+    const qrSize = 85;
+    const qrX = pageWidth - 35 - qrSize;
+    const qrY = batchInfoY - 60;
+    
     page1.drawImage(qrImage, {
       x: qrX,
-      y: bottomY - 70,
+      y: qrY,
       width: qrSize,
       height: qrSize,
     });
 
-    // "Echtheit" label centered under QR
+    // "Echtheit" label under QR
     const echtText = 'Echtheit';
     page1.drawText(echtText, {
       x: qrX + (qrSize - helvetica.widthOfTextAtSize(echtText, 10)) / 2,
-      y: bottomY - 85,
+      y: qrY - 15,
       size: 10,
       font: helvetica,
       color: gray,
@@ -368,7 +367,7 @@ async function generateLabelPDF(data) {
   }
 
   // ============================================================================
-  // PAGE 2: FORMULA SHEET
+  // PAGE 2: FORMULA SHEET (also taller)
   // ============================================================================
   const page2 = pdfDoc.addPage([pageWidth, pageHeight]);
   y = pageHeight - 40;
@@ -383,7 +382,7 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 28;
+  y -= 30;
 
   // Batch line
   const batchLine = `Batch ${data.batch || 'N/A'}`;
@@ -395,7 +394,7 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 22;
+  y -= 24;
 
   // "for [Name]"
   const forLine = `for ${data.name || 'Customer'}`;
@@ -407,16 +406,15 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 40;
+  y -= 45;
 
   const leftMargin = 30;
   const rightMargin = pageWidth - 30;
 
-  // Helper to draw note groups
+  // Draw note groups
   const drawNoteGroup = (title, notes) => {
     if (!notes || notes.length === 0) return;
 
-    // Section title
     page2.drawText(title, {
       x: leftMargin,
       y: y,
@@ -424,9 +422,8 @@ async function generateLabelPDF(data) {
       font: helveticaBold,
       color: black,
     });
-    y -= 18;
+    y -= 20;
 
-    // Notes
     notes.forEach(note => {
       page2.drawText(note.name || 'Unknown', {
         x: leftMargin,
@@ -445,10 +442,10 @@ async function generateLabelPDF(data) {
         color: gray,
       });
 
-      y -= 16;
+      y -= 18;
     });
 
-    y -= 12;
+    y -= 15;
   };
 
   drawNoteGroup('KOPFNOTEN', topNotes);
@@ -464,9 +461,9 @@ async function generateLabelPDF(data) {
     color: black,
   });
 
-  y -= 25;
+  y -= 28;
 
-  // Totals section
+  // Totals
   const drawTotalRow = (label, value) => {
     page2.drawText(label, {
       x: leftMargin,
@@ -482,7 +479,7 @@ async function generateLabelPDF(data) {
       font: helveticaBold,
       color: black,
     });
-    y -= 20;
+    y -= 22;
   };
 
   drawTotalRow('PARFUM OIL', `${totalOil.toFixed(3)}g`);
