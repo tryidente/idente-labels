@@ -1,5 +1,5 @@
 // netlify/functions/generate-labels.js
-// 2-Page Professional Label Generator matching Quiz Results Design
+// 2-Page Professional Label Generator - Matching Quiz Design Exactly
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 const nodemailer = require('nodemailer');
 const QRCode = require('qrcode');
@@ -13,7 +13,6 @@ exports.handler = async (event, context) => {
 
     const labels = [];
 
-    // Process each line item
     for (const item of order.line_items) {
       console.log(`📝 Processing item: ${item.name}`);
 
@@ -22,18 +21,15 @@ exports.handler = async (event, context) => {
         continue;
       }
 
-      // Convert properties array to object
       const props = {};
       item.properties.forEach(p => {
         props[p.name] = p.value;
       });
 
-      // Check if bundle
       if (props._quiz_type === 'bundle') {
-        console.log('📦 Bundle detected - generating 3 labels (main + 2 recs)');
+        console.log('📦 Bundle detected - generating 3 labels');
         const bundleData = JSON.parse(props._quiz_data);
 
-        // Main profile
         if (bundleData.main) {
           const quizData = {
             batch: props._quiz_batch,
@@ -45,7 +41,6 @@ exports.handler = async (event, context) => {
             match: bundleData.main.match,
             formula: bundleData.main.profile.notes
           };
-
           const pdf = await generateLabelPDF(quizData);
           labels.push({
             filename: `IDENTE-${quizData.profile.replace(/\s/g, '-')}-${props._quiz_batch}.pdf`,
@@ -53,7 +48,6 @@ exports.handler = async (event, context) => {
           });
         }
 
-        // Recommendation 1
         if (bundleData.rec1) {
           const quizData = {
             batch: props._quiz_batch,
@@ -65,7 +59,6 @@ exports.handler = async (event, context) => {
             match: bundleData.rec1.match,
             formula: bundleData.rec1.profile.notes
           };
-
           const pdf = await generateLabelPDF(quizData);
           labels.push({
             filename: `IDENTE-${quizData.profile.replace(/\s/g, '-')}-${props._quiz_batch}-rec1.pdf`,
@@ -73,7 +66,6 @@ exports.handler = async (event, context) => {
           });
         }
 
-        // Recommendation 2
         if (bundleData.rec2) {
           const quizData = {
             batch: props._quiz_batch,
@@ -85,7 +77,6 @@ exports.handler = async (event, context) => {
             match: bundleData.rec2.match,
             formula: bundleData.rec2.profile.notes
           };
-
           const pdf = await generateLabelPDF(quizData);
           labels.push({
             filename: `IDENTE-${quizData.profile.replace(/\s/g, '-')}-${props._quiz_batch}-rec2.pdf`,
@@ -93,7 +84,6 @@ exports.handler = async (event, context) => {
           });
         }
       } else {
-        // Single product
         console.log('📄 Single product - generating 1 label');
         
         let formula = {};
@@ -144,23 +134,42 @@ exports.handler = async (event, context) => {
   }
 };
 
+// Generate QR URL exactly like the quiz does
+function generateQRUrl(data) {
+  const qd = {
+    b: data.batch,
+    n: data.name,
+    d: data.date,
+    c: data.concentration,
+    h: data.harmonie,
+    m: data.match
+  };
+  const json = JSON.stringify(qd);
+  
+  // This is EXACTLY how the quiz encodes it:
+  // btoa(encodeURIComponent(json).replace(/%([0-9A-F]{2})/g, (match, p1) => String.fromCharCode('0x' + p1)))
+  const encoded = encodeURIComponent(json);
+  const replaced = encoded.replace(/%([0-9A-F]{2})/g, (match, p1) => String.fromCharCode(parseInt(p1, 16)));
+  const b64 = Buffer.from(replaced).toString('base64');
+  
+  return 'https://tryidente.com/pages/verify?d=' + b64;
+}
+
 async function generateLabelPDF(data) {
   console.log(`🎨 Generating 2-page PDF for ${data.profile}`);
 
   const pdfDoc = await PDFDocument.create();
   
-  // Embed fonts
   const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const helveticaOblique = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
   
-  // Page dimensions (optimized for label printing - roughly 80mm x 120mm)
-  const pageWidth = 226.77; // 80mm in points
-  const pageHeight = 340.16; // 120mm in points
+  // Larger page for better readability (A6 size: 105mm x 148mm)
+  const pageWidth = 297.64;
+  const pageHeight = 419.53;
   
-  // Colors
   const black = rgb(0, 0, 0);
-  const gray = rgb(0.4, 0.4, 0.4);
+  const gray = rgb(0.5, 0.5, 0.5);
   
   // Calculate totals
   const topNotes = data.formula?.top || [];
@@ -175,373 +184,311 @@ async function generateLabelPDF(data) {
   const concentration = data.concentration || 22;
 
   // ============================================================================
-  // PAGE 1: FRONT LABEL
+  // PAGE 1: FRONT LABEL (Clean, Professional Design)
   // ============================================================================
   const page1 = pdfDoc.addPage([pageWidth, pageHeight]);
-  let y = pageHeight - 25;
+  const centerX = pageWidth / 2;
+  let y = pageHeight - 35;
 
-  // Batch number top right
-  const batchText = `#${data.batch || '00000000'}`;
-  const batchWidth = helvetica.widthOfTextAtSize(batchText, 9);
-  page1.drawText(batchText, {
-    x: pageWidth - 20 - batchWidth,
+  // Batch number - top right corner
+  const batchNumText = `#${data.batch || '00000000'}`;
+  page1.drawText(batchNumText, {
+    x: pageWidth - 30 - helvetica.widthOfTextAtSize(batchNumText, 10),
     y: y,
-    size: 9,
+    size: 10,
     font: helvetica,
     color: black,
   });
 
-  y -= 30;
+  y -= 50;
 
-  // IDENTÉ Logo (large, bold)
+  // IDENTÉ Logo - Large and Bold
   const logoText = 'IDENTE';
-  const logoSize = 42;
-  const logoWidth = helveticaBold.widthOfTextAtSize(logoText, logoSize);
+  const logoSize = 52;
   page1.drawText(logoText, {
-    x: (pageWidth - logoWidth) / 2,
+    x: centerX - helveticaBold.widthOfTextAtSize(logoText, logoSize) / 2,
     y: y,
     size: logoSize,
     font: helveticaBold,
     color: black,
   });
 
-  y -= 28;
+  y -= 40;
 
-  // "for [Name]"
+  // "for [Name]" - Italic
   const forText = `for ${data.name || 'Customer'}`;
-  const forWidth = helveticaOblique.widthOfTextAtSize(forText, 16);
   page1.drawText(forText, {
-    x: (pageWidth - forWidth) / 2,
+    x: centerX - helveticaOblique.widthOfTextAtSize(forText, 20) / 2,
+    y: y,
+    size: 20,
+    font: helveticaOblique,
+    color: black,
+  });
+
+  y -= 35;
+
+  // "Eau de Parfum" - Italic
+  const eauText = 'Eau de Parfum';
+  page1.drawText(eauText, {
+    x: centerX - helveticaOblique.widthOfTextAtSize(eauText, 16) / 2,
     y: y,
     size: 16,
     font: helveticaOblique,
     color: black,
   });
 
-  y -= 28;
+  y -= 55;
 
-  // "Eau de Parfum"
-  const eauText = 'Eau de Parfum';
-  const eauWidth = helveticaOblique.widthOfTextAtSize(eauText, 14);
-  page1.drawText(eauText, {
-    x: (pageWidth - eauWidth) / 2,
-    y: y,
-    size: 14,
-    font: helveticaOblique,
-    color: black,
-  });
-
-  y -= 45;
-
-  // Large concentration percentage
+  // Large Concentration Percentage
   const concText = `${concentration}%`;
-  const concSize = 48;
-  const concWidth = helveticaBold.widthOfTextAtSize(concText, concSize);
+  const concSize = 62;
   page1.drawText(concText, {
-    x: (pageWidth - concWidth) / 2,
+    x: centerX - helveticaBold.widthOfTextAtSize(concText, concSize) / 2,
     y: y,
     size: concSize,
     font: helveticaBold,
     color: black,
   });
 
-  y -= 28;
+  y -= 35;
 
-  // Specs line
-  const specsText = `${concentration}% - 50ml - ${noteCount} Notes`;
-  const specsWidth = helvetica.widthOfTextAtSize(specsText, 11);
+  // Specs line with dots
+  const specsText = `${concentration}% \u00B7 50ml \u00B7 ${noteCount} Notes`;
   page1.drawText(specsText, {
-    x: (pageWidth - specsWidth) / 2,
+    x: centerX - helvetica.widthOfTextAtSize(specsText, 13) / 2,
     y: y,
-    size: 11,
+    size: 13,
     font: helvetica,
     color: black,
   });
 
-  y -= 18;
+  y -= 25;
 
-  // Horizontal line
+  // Horizontal divider line
+  const lineMargin = 60;
   page1.drawLine({
-    start: { x: 40, y: y },
-    end: { x: pageWidth - 40, y: y },
-    thickness: 1,
-    color: black,
-  });
-
-  y -= 22;
-
-  // "Handcrafted in Germany"
-  const hcText = 'Handcrafted in Germany';
-  const hcWidth = helvetica.widthOfTextAtSize(hcText, 11);
-  page1.drawText(hcText, {
-    x: (pageWidth - hcWidth) / 2,
-    y: y,
-    size: 11,
-    font: helvetica,
-    color: black,
-  });
-
-  y -= 16;
-
-  // "100% Vegan · Cruelty Free"
-  const veganText = '100% Vegan - Cruelty Free';
-  const veganWidth = helvetica.widthOfTextAtSize(veganText, 10);
-  page1.drawText(veganText, {
-    x: (pageWidth - veganWidth) / 2,
-    y: y,
-    size: 10,
-    font: helvetica,
+    start: { x: lineMargin, y: y },
+    end: { x: pageWidth - lineMargin, y: y },
+    thickness: 1.5,
     color: black,
   });
 
   y -= 30;
 
-  // BATCH INFO section
-  const batchInfoX = 25;
-  
-  page1.drawText('BATCH INFO', {
-    x: batchInfoX,
+  // "Handcrafted in Germany"
+  const hcText = 'Handcrafted in Germany';
+  page1.drawText(hcText, {
+    x: centerX - helvetica.widthOfTextAtSize(hcText, 14) / 2,
     y: y,
-    size: 11,
+    size: 14,
+    font: helvetica,
+    color: black,
+  });
+
+  y -= 22;
+
+  // "100% Vegan · Cruelty Free"
+  const veganText = '100% Vegan \u00B7 Cruelty Free';
+  page1.drawText(veganText, {
+    x: centerX - helvetica.widthOfTextAtSize(veganText, 12) / 2,
+    y: y,
+    size: 12,
+    font: helvetica,
+    color: black,
+  });
+
+  y -= 45;
+
+  // Bottom section with BATCH INFO (left) and QR Code (right)
+  const bottomY = y;
+  const leftX = 35;
+  const qrX = pageWidth - 130;
+
+  // BATCH INFO title
+  page1.drawText('BATCH INFO', {
+    x: leftX,
+    y: bottomY,
+    size: 13,
     font: helveticaBold,
     color: black,
   });
 
-  y -= 16;
-
+  // Batch number
   page1.drawText(`Batch: ${data.batch || 'N/A'}`, {
-    x: batchInfoX,
-    y: y,
-    size: 10,
+    x: leftX,
+    y: bottomY - 22,
+    size: 12,
     font: helvetica,
     color: black,
   });
 
-  y -= 14;
-
+  // Date
   page1.drawText(`Date: ${data.date || 'N/A'}`, {
-    x: batchInfoX,
-    y: y,
-    size: 10,
+    x: leftX,
+    y: bottomY - 42,
+    size: 12,
     font: helvetica,
     color: black,
   });
 
-  // QR Code on the right side
+  // QR Code - using exact same encoding as quiz
   try {
-    const qrData = {
-      b: data.batch,
-      n: data.name,
-      d: data.date,
-      c: concentration,
-      h: data.harmonie,
-      m: data.match
-    };
-    const qrJson = JSON.stringify(qrData);
-    const qrBase64Data = Buffer.from(encodeURIComponent(qrJson)).toString('base64');
-    const qrUrl = `https://tryidente.com/pages/verify?d=${qrBase64Data}`;
+    const qrUrl = generateQRUrl(data);
+    console.log('📱 QR URL:', qrUrl);
     
-    // Generate QR code as PNG data URL
     const qrDataUrl = await QRCode.toDataURL(qrUrl, {
-      width: 80,
+      width: 200,
       margin: 1,
+      errorCorrectionLevel: 'L',
       color: { dark: '#000000', light: '#ffffff' }
     });
     
-    // Extract base64 data from data URL
     const qrImageData = qrDataUrl.replace(/^data:image\/png;base64,/, '');
     const qrImage = await pdfDoc.embedPng(Buffer.from(qrImageData, 'base64'));
     
-    const qrSize = 70;
-    const qrX = pageWidth - 25 - qrSize;
-    const qrY = y - 35;
-    
+    const qrSize = 90;
     page1.drawImage(qrImage, {
       x: qrX,
-      y: qrY,
+      y: bottomY - 70,
       width: qrSize,
       height: qrSize,
     });
 
-    // "Echtheit" label under QR
+    // "Echtheit" label centered under QR
     const echtText = 'Echtheit';
-    const echtWidth = helvetica.widthOfTextAtSize(echtText, 8);
     page1.drawText(echtText, {
-      x: qrX + (qrSize - echtWidth) / 2,
-      y: qrY - 12,
-      size: 8,
+      x: qrX + (qrSize - helvetica.widthOfTextAtSize(echtText, 10)) / 2,
+      y: bottomY - 85,
+      size: 10,
       font: helvetica,
       color: gray,
     });
   } catch (qrError) {
-    console.log('⚠️ QR code generation failed:', qrError.message);
+    console.log('⚠️ QR generation failed:', qrError.message);
   }
 
   // ============================================================================
   // PAGE 2: FORMULA SHEET
   // ============================================================================
   const page2 = pdfDoc.addPage([pageWidth, pageHeight]);
-  y = pageHeight - 30;
+  y = pageHeight - 40;
 
   // FORMULA title
   const formulaTitle = 'FORMULA';
-  const formulaTitleWidth = helveticaBold.widthOfTextAtSize(formulaTitle, 24);
   page2.drawText(formulaTitle, {
-    x: (pageWidth - formulaTitleWidth) / 2,
+    x: centerX - helveticaBold.widthOfTextAtSize(formulaTitle, 28) / 2,
     y: y,
-    size: 24,
+    size: 28,
     font: helveticaBold,
     color: black,
   });
 
-  y -= 20;
+  y -= 28;
 
-  // Batch number
+  // Batch line
   const batchLine = `Batch ${data.batch || 'N/A'}`;
-  const batchLineWidth = helvetica.widthOfTextAtSize(batchLine, 11);
   page2.drawText(batchLine, {
-    x: (pageWidth - batchLineWidth) / 2,
+    x: centerX - helvetica.widthOfTextAtSize(batchLine, 12) / 2,
     y: y,
-    size: 11,
+    size: 12,
     font: helvetica,
     color: black,
   });
 
-  y -= 16;
+  y -= 22;
 
   // "for [Name]"
   const forLine = `for ${data.name || 'Customer'}`;
-  const forLineWidth = helveticaOblique.widthOfTextAtSize(forLine, 12);
   page2.drawText(forLine, {
-    x: (pageWidth - forLineWidth) / 2,
+    x: centerX - helveticaOblique.widthOfTextAtSize(forLine, 14) / 2,
     y: y,
-    size: 12,
+    size: 14,
     font: helveticaOblique,
     color: black,
   });
 
-  y -= 25;
+  y -= 40;
 
-  const leftMargin = 20;
-  const rightMargin = pageWidth - 20;
+  const leftMargin = 30;
+  const rightMargin = pageWidth - 30;
 
-  // Helper function to draw note group
+  // Helper to draw note groups
   const drawNoteGroup = (title, notes) => {
     if (!notes || notes.length === 0) return;
 
-    // Group title
+    // Section title
     page2.drawText(title, {
       x: leftMargin,
       y: y,
-      size: 10,
+      size: 11,
       font: helveticaBold,
       color: black,
     });
-    y -= 14;
+    y -= 18;
 
     // Notes
     notes.forEach(note => {
       page2.drawText(note.name || 'Unknown', {
         x: leftMargin,
         y: y,
-        size: 9,
+        size: 11,
         font: helvetica,
         color: black,
       });
 
       const weightText = `${(note.weight || 0).toFixed(3)}g`;
-      const weightWidth = helvetica.widthOfTextAtSize(weightText, 9);
       page2.drawText(weightText, {
-        x: rightMargin - weightWidth,
+        x: rightMargin - helvetica.widthOfTextAtSize(weightText, 11),
         y: y,
-        size: 9,
+        size: 11,
         font: helvetica,
         color: gray,
       });
 
-      y -= 12;
+      y -= 16;
     });
 
-    y -= 8;
+    y -= 12;
   };
 
-  // Draw note groups
   drawNoteGroup('KOPFNOTEN', topNotes);
   drawNoteGroup('HERZNOTEN', heartNotes);
   drawNoteGroup('BASISNOTEN', baseNotes);
 
-  // Totals section
+  // Divider before totals
   y -= 5;
-  
-  // Line above totals
   page2.drawLine({
     start: { x: leftMargin, y: y },
     end: { x: rightMargin, y: y },
-    thickness: 1,
+    thickness: 1.5,
     color: black,
   });
 
-  y -= 18;
+  y -= 25;
 
-  // PARFÜMÖL (using PARFUMOL without umlaut for compatibility)
-  page2.drawText('PARFUM OL', {
-    x: leftMargin,
-    y: y,
-    size: 10,
-    font: helveticaBold,
-    color: black,
-  });
-  const oilText = `${totalOil.toFixed(3)}g`;
-  const oilWidth = helveticaBold.widthOfTextAtSize(oilText, 10);
-  page2.drawText(oilText, {
-    x: rightMargin - oilWidth,
-    y: y,
-    size: 10,
-    font: helveticaBold,
-    color: black,
-  });
+  // Totals section
+  const drawTotalRow = (label, value) => {
+    page2.drawText(label, {
+      x: leftMargin,
+      y: y,
+      size: 12,
+      font: helveticaBold,
+      color: black,
+    });
+    page2.drawText(value, {
+      x: rightMargin - helveticaBold.widthOfTextAtSize(value, 12),
+      y: y,
+      size: 12,
+      font: helveticaBold,
+      color: black,
+    });
+    y -= 20;
+  };
 
-  y -= 14;
+  drawTotalRow('PARFUM OIL', `${totalOil.toFixed(3)}g`);
+  drawTotalRow('ALKOHOL (96%)', `${totalAlcohol.toFixed(3)}g`);
+  drawTotalRow('TOTAL', `${totalWeight.toFixed(3)}g`);
 
-  // ALKOHOL
-  page2.drawText('ALKOHOL (96%)', {
-    x: leftMargin,
-    y: y,
-    size: 10,
-    font: helveticaBold,
-    color: black,
-  });
-  const alcText = `${totalAlcohol.toFixed(3)}g`;
-  const alcWidth = helveticaBold.widthOfTextAtSize(alcText, 10);
-  page2.drawText(alcText, {
-    x: rightMargin - alcWidth,
-    y: y,
-    size: 10,
-    font: helveticaBold,
-    color: black,
-  });
-
-  y -= 14;
-
-  // TOTAL
-  page2.drawText('TOTAL', {
-    x: leftMargin,
-    y: y,
-    size: 10,
-    font: helveticaBold,
-    color: black,
-  });
-  const totalText = `${totalWeight.toFixed(3)}g`;
-  const totalWidth = helveticaBold.widthOfTextAtSize(totalText, 10);
-  page2.drawText(totalText, {
-    x: rightMargin - totalWidth,
-    y: y,
-    size: 10,
-    font: helveticaBold,
-    color: black,
-  });
-
-  // Save PDF
   const pdfBytes = await pdfDoc.save();
   console.log(`✅ 2-page PDF generated for ${data.profile}`);
   
@@ -570,11 +517,7 @@ async function sendEmail(order, labels) {
       <p><strong>Email:</strong> ${order.customer?.email || 'N/A'}</p>
       <p><strong>Anzahl Etiketten:</strong> ${labels.length}</p>
       <hr>
-      <p><small>Etiketten sind als PDF angehaengt. Jedes PDF hat 2 Seiten:</small></p>
-      <ul>
-        <li>Seite 1: Flaschenetikett mit QR-Code</li>
-        <li>Seite 2: Formelblatt mit allen Duftnoten</li>
-      </ul>
+      <p>Jedes PDF hat 2 Seiten: Flaschenetikett + Formelblatt</p>
     `,
     attachments: labels
   });
