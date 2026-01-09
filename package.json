@@ -1,9 +1,9 @@
 {
   "name": "idente-labels",
   "version": "1.0.0",
-  "description": "IDENTÉ Label Generator",
+  "description": "IDENTE Label Generator",
   "dependencies": {
-    "pdfkit": "^0.13.0",
+    "pdf-lib": "^1.17.1",
     "nodemailer": "^6.9.7"
   }
 }

@@ -1,6 +1,6 @@
 // netlify/functions/generate-labels.js
-// Uses PDFKit for PDF generation (no Chromium needed)
-const PDFDocument = require('pdfkit');
+// Uses pdf-lib for PDF generation (pure JS, no external dependencies)
+const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 const nodemailer = require('nodemailer');
 
 exports.handler = async (event, context) => {
@@ -147,216 +147,238 @@ exports.handler = async (event, context) => {
 async function generateLabelPDF(data) {
   console.log(`🎨 Generating PDF for ${data.profile}`);
 
-  return new Promise((resolve, reject) => {
-    try {
-      // A6 size in points (105mm x 148mm)
-      const doc = new PDFDocument({
-        size: [297.64, 419.53], // A6 in points
-        margins: { top: 28, bottom: 28, left: 28, right: 28 }
-      });
-
-      const chunks = [];
-      doc.on('data', chunk => chunks.push(chunk));
-      doc.on('end', () => {
-        const pdfBuffer = Buffer.concat(chunks);
-        console.log(`✅ PDF generated for ${data.profile}`);
-        resolve(pdfBuffer);
-      });
-      doc.on('error', reject);
-
-      // Colors
-      const brandGreen = '#0A3D2C';
-      const gold = '#C5A059';
-      const lightGold = '#FEF3C7';
-      const gray = '#666666';
-      const lightGray = '#f9fafb';
-
-      // Header
-      doc.fontSize(28)
-         .fillColor(brandGreen)
-         .font('Helvetica-Bold')
-         .text('IDENTÉ', { align: 'center' });
-
-      doc.moveDown(0.3);
-      doc.fontSize(18)
-         .fillColor(brandGreen)
-         .font('Helvetica-Bold')
-         .text(data.profile || 'Personalisiert', { align: 'center' });
-
-      doc.moveDown(0.2);
-      doc.fontSize(8)
-         .fillColor(gray)
-         .font('Helvetica')
-         .text('INDIVIDUAL SCENT FORMULA', { align: 'center' });
-
-      // Divider line
-      doc.moveDown(0.5);
-      const lineY = doc.y;
-      doc.strokeColor(brandGreen)
-         .lineWidth(2)
-         .moveTo(28, lineY)
-         .lineTo(269, lineY)
-         .stroke();
-
-      // Info section
-      doc.moveDown(0.8);
-      
-      // Info box background
-      const infoBoxY = doc.y;
-      doc.rect(28, infoBoxY, 241, 60)
-         .fill(lightGray);
-
-      doc.fillColor('#333333');
-      
-      // Left column
-      doc.fontSize(8)
-         .font('Helvetica-Bold')
-         .fillColor(gray)
-         .text('Batch', 38, infoBoxY + 8);
-      doc.fontSize(10)
-         .font('Helvetica-Bold')
-         .fillColor(brandGreen)
-         .text(data.batch || 'N/A', 38, infoBoxY + 18);
-
-      doc.fontSize(8)
-         .font('Helvetica-Bold')
-         .fillColor(gray)
-         .text('Erstellt für', 38, infoBoxY + 35);
-      doc.fontSize(10)
-         .font('Helvetica-Bold')
-         .fillColor(brandGreen)
-         .text(data.name || 'N/A', 38, infoBoxY + 45);
-
-      // Right column
-      doc.fontSize(8)
-         .font('Helvetica-Bold')
-         .fillColor(gray)
-         .text('Datum', 155, infoBoxY + 8);
-      doc.fontSize(10)
-         .font('Helvetica-Bold')
-         .fillColor(brandGreen)
-         .text(data.date || 'N/A', 155, infoBoxY + 18);
-
-      doc.fontSize(8)
-         .font('Helvetica-Bold')
-         .fillColor(gray)
-         .text('Konzentration', 155, infoBoxY + 35);
-      doc.fontSize(10)
-         .font('Helvetica-Bold')
-         .fillColor(brandGreen)
-         .text(data.concentration || 'N/A', 155, infoBoxY + 45);
-
-      // Score boxes
-      doc.y = infoBoxY + 70;
-      const scoreY = doc.y;
-      const scoreBoxWidth = 75;
-      const scoreBoxHeight = 45;
-      const scoreStartX = 28;
-      const scoreGap = 8;
-
-      // Harmonie box
-      doc.rect(scoreStartX, scoreY, scoreBoxWidth, scoreBoxHeight)
-         .fillAndStroke(lightGold, gold);
-      doc.fontSize(7)
-         .font('Helvetica-Bold')
-         .fillColor('#78350f')
-         .text('HARMONIE', scoreStartX, scoreY + 8, { width: scoreBoxWidth, align: 'center' });
-      doc.fontSize(16)
-         .font('Helvetica-Bold')
-         .fillColor(brandGreen)
-         .text(`${data.harmonie}/100`, scoreStartX, scoreY + 22, { width: scoreBoxWidth, align: 'center' });
-
-      // Match box
-      const matchX = scoreStartX + scoreBoxWidth + scoreGap;
-      doc.rect(matchX, scoreY, scoreBoxWidth, scoreBoxHeight)
-         .fillAndStroke(lightGold, gold);
-      doc.fontSize(7)
-         .font('Helvetica-Bold')
-         .fillColor('#78350f')
-         .text('MATCH', matchX, scoreY + 8, { width: scoreBoxWidth, align: 'center' });
-      doc.fontSize(16)
-         .font('Helvetica-Bold')
-         .fillColor(brandGreen)
-         .text(`${data.match}%`, matchX, scoreY + 22, { width: scoreBoxWidth, align: 'center' });
-
-      // Quality box
-      const qualityX = matchX + scoreBoxWidth + scoreGap;
-      doc.rect(qualityX, scoreY, scoreBoxWidth, scoreBoxHeight)
-         .fillAndStroke(lightGold, gold);
-      doc.fontSize(7)
-         .font('Helvetica-Bold')
-         .fillColor('#78350f')
-         .text('QUALITÄT', qualityX, scoreY + 8, { width: scoreBoxWidth, align: 'center' });
-      doc.fontSize(16)
-         .font('Helvetica-Bold')
-         .fillColor(brandGreen)
-         .text('A+', qualityX, scoreY + 22, { width: scoreBoxWidth, align: 'center' });
-
-      // Formula section
-      doc.y = scoreY + scoreBoxHeight + 15;
-      
-      doc.fontSize(9)
-         .font('Helvetica-Bold')
-         .fillColor(brandGreen)
-         .text('FORMEL-KOMPOSITION', 28);
-      
-      doc.moveDown(0.3);
-      const formulaLineY = doc.y;
-      doc.strokeColor(brandGreen)
-         .lineWidth(1.5)
-         .moveTo(28, formulaLineY)
-         .lineTo(269, formulaLineY)
-         .stroke();
-
-      doc.moveDown(0.5);
-
-      // Notes
-      const topNotes = data.formula?.top || [];
-      const heartNotes = data.formula?.heart || [];
-      const baseNotes = data.formula?.base || [];
-
-      const drawNoteGroup = (title, notes) => {
-        if (notes.length === 0) return;
-        
-        doc.fontSize(8)
-           .font('Helvetica-Bold')
-           .fillColor(gold)
-           .text(title.toUpperCase(), 28);
-        
-        doc.moveDown(0.2);
-        
-        notes.forEach(note => {
-          const noteY = doc.y;
-          doc.fontSize(8)
-             .font('Helvetica')
-             .fillColor('#333333')
-             .text(note.name, 28, noteY);
-          doc.fontSize(8)
-             .font('Helvetica-Bold')
-             .fillColor(gray)
-             .text(`${note.weight.toFixed(3)}g`, 200, noteY, { width: 69, align: 'right' });
-          doc.moveDown(0.3);
-        });
-        
-        doc.moveDown(0.3);
-      };
-
-      drawNoteGroup('Kopfnoten', topNotes);
-      drawNoteGroup('Herznoten', heartNotes);
-      drawNoteGroup('Basisnoten', baseNotes);
-
-      // Footer
-      doc.fontSize(7)
-         .font('Helvetica')
-         .fillColor('#999999')
-         .text('Handcrafted in Germany · 100% Vegan · Cruelty Free', 28, 385, { align: 'center', width: 241 });
-      doc.text('tryidente.com', { align: 'center', width: 241 });
-
-      doc.end();
-    } catch (err) {
-      reject(err);
-    }
+  // Create A6 size PDF (105mm x 148mm = 297.64 x 419.53 points)
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([297.64, 419.53]);
+  
+  // Embed fonts
+  const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  
+  const { width, height } = page.getSize();
+  
+  // Colors
+  const brandGreen = rgb(0.039, 0.239, 0.173); // #0A3D2C
+  const gold = rgb(0.773, 0.627, 0.349); // #C5A059
+  const gray = rgb(0.4, 0.4, 0.4);
+  const lightGray = rgb(0.6, 0.6, 0.6);
+  const darkText = rgb(0.2, 0.2, 0.2);
+  
+  let y = height - 40;
+  
+  // Header - IDENTÉ
+  page.drawText('IDENTE', {
+    x: width / 2 - helveticaBold.widthOfTextAtSize('IDENTE', 28) / 2,
+    y: y,
+    size: 28,
+    font: helveticaBold,
+    color: brandGreen,
   });
+  
+  y -= 25;
+  
+  // Profile name
+  const profileName = data.profile || 'Personalisiert';
+  page.drawText(profileName, {
+    x: width / 2 - helveticaBold.widthOfTextAtSize(profileName, 18) / 2,
+    y: y,
+    size: 18,
+    font: helveticaBold,
+    color: brandGreen,
+  });
+  
+  y -= 18;
+  
+  // Subtitle
+  const subtitle = 'INDIVIDUAL SCENT FORMULA';
+  page.drawText(subtitle, {
+    x: width / 2 - helvetica.widthOfTextAtSize(subtitle, 8) / 2,
+    y: y,
+    size: 8,
+    font: helvetica,
+    color: gray,
+  });
+  
+  y -= 15;
+  
+  // Divider line
+  page.drawLine({
+    start: { x: 28, y: y },
+    end: { x: width - 28, y: y },
+    thickness: 2,
+    color: brandGreen,
+  });
+  
+  y -= 25;
+  
+  // Info section background
+  page.drawRectangle({
+    x: 28,
+    y: y - 55,
+    width: width - 56,
+    height: 60,
+    color: rgb(0.976, 0.98, 0.984),
+  });
+  
+  // Info grid
+  const leftCol = 38;
+  const rightCol = 155;
+  
+  // Batch
+  page.drawText('Batch', { x: leftCol, y: y - 10, size: 8, font: helveticaBold, color: gray });
+  page.drawText(data.batch || 'N/A', { x: leftCol, y: y - 22, size: 10, font: helveticaBold, color: brandGreen });
+  
+  // Datum
+  page.drawText('Datum', { x: rightCol, y: y - 10, size: 8, font: helveticaBold, color: gray });
+  page.drawText(data.date || 'N/A', { x: rightCol, y: y - 22, size: 10, font: helveticaBold, color: brandGreen });
+  
+  // Erstellt fuer
+  page.drawText('Erstellt fuer', { x: leftCol, y: y - 37, size: 8, font: helveticaBold, color: gray });
+  page.drawText(data.name || 'N/A', { x: leftCol, y: y - 49, size: 10, font: helveticaBold, color: brandGreen });
+  
+  // Konzentration
+  page.drawText('Konzentration', { x: rightCol, y: y - 37, size: 8, font: helveticaBold, color: gray });
+  page.drawText(data.concentration || 'N/A', { x: rightCol, y: y - 49, size: 10, font: helveticaBold, color: brandGreen });
+  
+  y -= 75;
+  
+  // Score boxes
+  const boxWidth = 75;
+  const boxHeight = 42;
+  const boxGap = 8;
+  const boxStartX = 28;
+  const lightGold = rgb(0.996, 0.953, 0.78); // #FEF3C7
+  
+  // Helper function to draw score box
+  const drawScoreBox = (x, label, value) => {
+    // Background
+    page.drawRectangle({
+      x: x,
+      y: y - boxHeight,
+      width: boxWidth,
+      height: boxHeight,
+      color: lightGold,
+      borderColor: gold,
+      borderWidth: 1.5,
+    });
+    
+    // Label
+    page.drawText(label, {
+      x: x + boxWidth / 2 - helveticaBold.widthOfTextAtSize(label, 7) / 2,
+      y: y - 12,
+      size: 7,
+      font: helveticaBold,
+      color: rgb(0.47, 0.21, 0.06),
+    });
+    
+    // Value
+    page.drawText(value, {
+      x: x + boxWidth / 2 - helveticaBold.widthOfTextAtSize(value, 14) / 2,
+      y: y - 32,
+      size: 14,
+      font: helveticaBold,
+      color: brandGreen,
+    });
+  };
+  
+  drawScoreBox(boxStartX, 'HARMONIE', `${data.harmonie}/100`);
+  drawScoreBox(boxStartX + boxWidth + boxGap, 'MATCH', `${data.match}%`);
+  drawScoreBox(boxStartX + (boxWidth + boxGap) * 2, 'QUALITAT', 'A+');
+  
+  y -= boxHeight + 20;
+  
+  // Formula section header
+  page.drawText('FORMEL-KOMPOSITION', {
+    x: 28,
+    y: y,
+    size: 9,
+    font: helveticaBold,
+    color: brandGreen,
+  });
+  
+  y -= 8;
+  
+  // Formula divider
+  page.drawLine({
+    start: { x: 28, y: y },
+    end: { x: width - 28, y: y },
+    thickness: 1.5,
+    color: brandGreen,
+  });
+  
+  y -= 15;
+  
+  // Notes
+  const topNotes = data.formula?.top || [];
+  const heartNotes = data.formula?.heart || [];
+  const baseNotes = data.formula?.base || [];
+  
+  const drawNoteGroup = (title, notes) => {
+    if (notes.length === 0) return;
+    
+    page.drawText(title.toUpperCase(), {
+      x: 28,
+      y: y,
+      size: 8,
+      font: helveticaBold,
+      color: gold,
+    });
+    
+    y -= 12;
+    
+    notes.forEach(note => {
+      page.drawText(note.name, {
+        x: 28,
+        y: y,
+        size: 8,
+        font: helvetica,
+        color: darkText,
+      });
+      
+      const weightText = `${note.weight.toFixed(3)}g`;
+      page.drawText(weightText, {
+        x: width - 28 - helveticaBold.widthOfTextAtSize(weightText, 8),
+        y: y,
+        size: 8,
+        font: helveticaBold,
+        color: gray,
+      });
+      
+      y -= 11;
+    });
+    
+    y -= 5;
+  };
+  
+  drawNoteGroup('Kopfnoten', topNotes);
+  drawNoteGroup('Herznoten', heartNotes);
+  drawNoteGroup('Basisnoten', baseNotes);
+  
+  // Footer
+  const footerY = 35;
+  const footerText1 = 'Handcrafted in Germany - 100% Vegan - Cruelty Free';
+  const footerText2 = 'tryidente.com';
+  
+  page.drawText(footerText1, {
+    x: width / 2 - helvetica.widthOfTextAtSize(footerText1, 7) / 2,
+    y: footerY,
+    size: 7,
+    font: helvetica,
+    color: lightGray,
+  });
+  
+  page.drawText(footerText2, {
+    x: width / 2 - helvetica.widthOfTextAtSize(footerText2, 7) / 2,
+    y: footerY - 10,
+    size: 7,
+    font: helvetica,
+    color: lightGray,
+  });
+  
+  const pdfBytes = await pdfDoc.save();
+  console.log(`✅ PDF generated for ${data.profile}`);
+  
+  return Buffer.from(pdfBytes);
 }
 
 async function sendEmail(order, labels) {
@@ -373,7 +395,7 @@ async function sendEmail(order, labels) {
   await transporter.sendMail({
     from: process.env.EMAIL_USER,
     to: process.env.LABEL_EMAIL || process.env.EMAIL_USER,
-    subject: `📦 IDENTÉ Order #${order.order_number} - ${labels.length} Etikett${labels.length > 1 ? 'en' : ''}`,
+    subject: `IDENTE Order #${order.order_number} - ${labels.length} Etikett${labels.length > 1 ? 'en' : ''}`,
     html: `
       <h2>Neue Order erhalten!</h2>
       <p><strong>Order:</strong> #${order.order_number}</p>
@@ -381,7 +403,7 @@ async function sendEmail(order, labels) {
       <p><strong>Email:</strong> ${order.customer?.email || 'N/A'}</p>
       <p><strong>Anzahl Etiketten:</strong> ${labels.length}</p>
       <hr>
-      <p><small>Etiketten sind als PDF angehängt.</small></p>
+      <p><small>Etiketten sind als PDF angehaengt.</small></p>
     `,
     attachments: labels
   });
