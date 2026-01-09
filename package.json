@@ -1,9 +1,10 @@
 {
   "name": "idente-labels",
   "version": "1.0.0",
-  "description": "IDENTE Label Generator",
+  "description": "IDENTE Label Generator - 2-Page Professional Labels",
   "dependencies": {
     "pdf-lib": "^1.17.1",
-    "nodemailer": "^6.9.7"
+    "nodemailer": "^6.9.7",
+    "qrcode": "^1.5.3"
   }
 }
