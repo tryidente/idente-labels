@@ -1,5 +1,7 @@
 // netlify/functions/generate-labels.js
 // IDENTÉ Personalized Perfume Label Generator
+// Supports single orders AND bundle orders (3 separate labels)
+
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 const nodemailer = require('nodemailer');
 const QRCode = require('qrcode');
@@ -81,7 +83,7 @@ const NOTES_DATABASE = {
 // PERSONALIZED FORMULA ALGORITHM
 // ═══════════════════════════════════════════════════════════════════════════
 
-function generatePersonalizedFormula(quizTags, concentration = 22) {
+function generatePersonalizedFormula(quizTags, concentration = 22, seed = 0) {
   const positiveTags = quizTags.positive || [];
   const excludeTags = quizTags.exclude || [];
   const intensityMod = quizTags.intensityModifier || 1.0;
@@ -95,6 +97,8 @@ function generatePersonalizedFormula(quizTags, concentration = 22) {
       if (note.tags.includes(tag)) score += 1;
     }
     score += note.intensity * intensityMod * 0.5;
+    // Add small random factor based on seed for variety
+    score += (seed % 10) * 0.01;
     return score;
   }
   
@@ -113,11 +117,10 @@ function generatePersonalizedFormula(quizTags, concentration = 22) {
     .filter(n => n.score > -1000)
     .sort((a, b) => b.score - a.score);
   
-  // Select: 4-5 top, 4-5 heart, 4-5 base
-  const batchSeed = Date.now() % 10;
-  const topCount = 4 + (batchSeed % 2);
-  const heartCount = 4 + ((batchSeed + 1) % 2);
-  const baseCount = 4 + ((batchSeed + 2) % 2);
+  // Select 4-5 from each based on seed
+  const topCount = 4 + (seed % 2);
+  const heartCount = 4 + ((seed + 1) % 2);
+  const baseCount = 4 + ((seed + 2) % 2);
   
   const selectedTop = scoredTop.slice(0, topCount);
   const selectedHeart = scoredHeart.slice(0, heartCount);
@@ -141,7 +144,6 @@ function generatePersonalizedFormula(quizTags, concentration = 22) {
       return { name: note.name, weight };
     });
     
-    // Normalize
     const currentTotal = weights.reduce((sum, n) => sum + n.weight, 0);
     const factor = totalWeight / currentTotal;
     return weights.map(n => ({ name: n.name, weight: n.weight * factor }));
@@ -180,56 +182,170 @@ exports.handler = async (event, context) => {
       const props = {};
       item.properties.forEach(p => { props[p.name] = p.value; });
 
-      // Get quiz data
-      const quizData = {
-        batch: props._quiz_batch || String(Date.now()).slice(-8),
-        name: props._quiz_name || order.customer?.first_name || 'Customer',
-        date: props._quiz_date || new Date().toLocaleDateString('de-DE'),
-        profile: props._quiz_profile || 'Custom',
-        concentration: parseInt(props._quiz_concentration) || 22,
-        harmonie: props._quiz_harmonie || '95',
-        match: props._quiz_match || '92'
-      };
-
-      // Parse quiz tags for personalization
-      let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
-      try {
-        if (props._quiz_tags) {
-          quizTags = JSON.parse(props._quiz_tags);
-        }
-      } catch (e) {
-        console.log('⚠️ Could not parse quiz tags, using defaults');
-      }
-
-      // Check for pre-calculated formula or generate new one
-      let formula;
-      if (props._quiz_formula) {
+      // ═══════════════════════════════════════════════════════════════════════
+      // CHECK IF BUNDLE OR SINGLE PRODUCT
+      // ═══════════════════════════════════════════════════════════════════════
+      
+      if (props._quiz_type === 'bundle') {
+        console.log('📦 BUNDLE ORDER DETECTED - Generating 3 labels');
+        
+        const baseBatch = props._quiz_batch || String(Date.now()).slice(-8);
+        const customerName = props._quiz_name || order.customer?.first_name || 'Customer';
+        const dateStr = props._quiz_date || new Date().toLocaleDateString('de-DE');
+        const concentration = parseInt(props._quiz_concentration) || 22;
+        const harmonie = props._quiz_harmonie || '95';
+        const match = props._quiz_match || '92';
+        
+        // Parse quiz tags
+        let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
         try {
-          const parsedFormula = JSON.parse(props._quiz_formula);
-          if (parsedFormula.top && parsedFormula.top[0] && parsedFormula.top[0].weight) {
-            formula = {
-              top: parsedFormula.top,
-              heart: parsedFormula.heart,
-              base: parsedFormula.base,
-              oilTotal: parsedFormula.oilTotal || 50 * (quizData.concentration / 100),
-              alcoholTotal: parsedFormula.alcoholTotal || 50 - (50 * (quizData.concentration / 100)),
-              grandTotal: 50
-            };
+          if (props._quiz_tags) quizTags = JSON.parse(props._quiz_tags);
+        } catch (e) { console.log('⚠️ Could not parse quiz tags'); }
+        
+        // ─────────────────────────────────────────────────────────────────────
+        // LABEL 1: Main Perfume
+        // ─────────────────────────────────────────────────────────────────────
+        let mainFormula;
+        try {
+          if (props._quiz_main_formula) {
+            mainFormula = JSON.parse(props._quiz_main_formula);
           } else {
-            formula = generatePersonalizedFormula(quizTags, quizData.concentration);
+            mainFormula = generatePersonalizedFormula(quizTags, concentration, 0);
           }
         } catch (e) {
-          formula = generatePersonalizedFormula(quizTags, quizData.concentration);
+          mainFormula = generatePersonalizedFormula(quizTags, concentration, 0);
         }
+        
+        const mainData = {
+          batch: baseBatch,
+          name: customerName,
+          date: dateStr,
+          profile: props._quiz_main_profile || 'IDENTÉ Custom',
+          concentration,
+          harmonie,
+          match
+        };
+        
+        const mainPdf = await generateLabelPDF(mainData, mainFormula);
+        labels.push({
+          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${baseBatch}-MAIN.pdf`,
+          content: mainPdf
+        });
+        console.log(`✅ Label 1/3 generated: ${mainData.profile}`);
+        
+        // ─────────────────────────────────────────────────────────────────────
+        // LABEL 2: First Recommendation
+        // ─────────────────────────────────────────────────────────────────────
+        let rec1Formula;
+        try {
+          if (props._quiz_rec1_formula) {
+            rec1Formula = JSON.parse(props._quiz_rec1_formula);
+          } else {
+            rec1Formula = generatePersonalizedFormula(quizTags, concentration, 1);
+          }
+        } catch (e) {
+          rec1Formula = generatePersonalizedFormula(quizTags, concentration, 1);
+        }
+        
+        const rec1Data = {
+          batch: String(parseInt(baseBatch) + 1),
+          name: customerName,
+          date: dateStr,
+          profile: props._quiz_rec1_profile || 'IDENTÉ Custom',
+          concentration,
+          harmonie: String(Math.max(80, parseInt(harmonie) - 2)),
+          match: String(Math.max(80, parseInt(match) - 3))
+        };
+        
+        const rec1Pdf = await generateLabelPDF(rec1Data, rec1Formula);
+        labels.push({
+          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${rec1Data.batch}-REC1.pdf`,
+          content: rec1Pdf
+        });
+        console.log(`✅ Label 2/3 generated: ${rec1Data.profile}`);
+        
+        // ─────────────────────────────────────────────────────────────────────
+        // LABEL 3: Second Recommendation
+        // ─────────────────────────────────────────────────────────────────────
+        let rec2Formula;
+        try {
+          if (props._quiz_rec2_formula) {
+            rec2Formula = JSON.parse(props._quiz_rec2_formula);
+          } else {
+            rec2Formula = generatePersonalizedFormula(quizTags, concentration, 2);
+          }
+        } catch (e) {
+          rec2Formula = generatePersonalizedFormula(quizTags, concentration, 2);
+        }
+        
+        const rec2Data = {
+          batch: String(parseInt(baseBatch) + 2),
+          name: customerName,
+          date: dateStr,
+          profile: props._quiz_rec2_profile || 'IDENTÉ Custom',
+          concentration,
+          harmonie: String(Math.max(80, parseInt(harmonie) - 4)),
+          match: String(Math.max(80, parseInt(match) - 5))
+        };
+        
+        const rec2Pdf = await generateLabelPDF(rec2Data, rec2Formula);
+        labels.push({
+          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${rec2Data.batch}-REC2.pdf`,
+          content: rec2Pdf
+        });
+        console.log(`✅ Label 3/3 generated: ${rec2Data.profile}`);
+        
       } else {
-        formula = generatePersonalizedFormula(quizTags, quizData.concentration);
-      }
+        // ═══════════════════════════════════════════════════════════════════════
+        // SINGLE PRODUCT ORDER
+        // ═══════════════════════════════════════════════════════════════════════
+        console.log('📝 SINGLE ORDER - Generating 1 label');
+        
+        const quizData = {
+          batch: props._quiz_batch || String(Date.now()).slice(-8),
+          name: props._quiz_name || order.customer?.first_name || 'Customer',
+          date: props._quiz_date || new Date().toLocaleDateString('de-DE'),
+          profile: props._quiz_profile || 'IDENTÉ Custom',
+          concentration: parseInt(props._quiz_concentration) || 22,
+          harmonie: props._quiz_harmonie || '95',
+          match: props._quiz_match || '92'
+        };
 
-      const pdf = await generateLabelPDF(quizData, formula);
-      labels.push({
-        filename: `IDENTE-${quizData.name.replace(/\s/g, '-')}-${quizData.batch}.pdf`,
-        content: pdf
-      });
+        let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
+        try {
+          if (props._quiz_tags) quizTags = JSON.parse(props._quiz_tags);
+        } catch (e) { console.log('⚠️ Could not parse quiz tags'); }
+
+        let formula;
+        if (props._quiz_formula) {
+          try {
+            const parsedFormula = JSON.parse(props._quiz_formula);
+            if (parsedFormula.top && parsedFormula.top[0] && parsedFormula.top[0].weight) {
+              formula = {
+                top: parsedFormula.top,
+                heart: parsedFormula.heart,
+                base: parsedFormula.base,
+                oilTotal: parsedFormula.oilTotal || 50 * (quizData.concentration / 100),
+                alcoholTotal: parsedFormula.alcoholTotal || 50 - (50 * (quizData.concentration / 100)),
+                grandTotal: 50
+              };
+            } else {
+              formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
+            }
+          } catch (e) {
+            formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
+          }
+        } else {
+          formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
+        }
+
+        const pdf = await generateLabelPDF(quizData, formula);
+        labels.push({
+          filename: `IDENTE-${quizData.name.replace(/\s/g, '-')}-${quizData.batch}.pdf`,
+          content: pdf
+        });
+        console.log(`✅ Single label generated: ${quizData.profile}`);
+      }
     }
 
     if (labels.length > 0) {
@@ -266,13 +382,12 @@ function getShortProfileName(profile) {
 }
 
 async function generateLabelPDF(data, formula) {
-  console.log(`🎨 Generating PDF for ${data.name}`);
+  console.log(`🎨 Generating PDF for ${data.name} - ${data.profile}`);
 
   const pdfDoc = await PDFDocument.create();
   const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
   
-  // Page: 6cm x 15cm
   const pageWidth = 170;
   const pageHeight = 425;
   const black = rgb(0, 0, 0);
@@ -417,11 +532,24 @@ async function sendEmail(order, labels) {
     auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
   });
 
+  const isBundle = labels.length === 3;
+  const subject = isBundle 
+    ? `IDENTE Order #${order.order_number} - TRIO BUNDLE (3 Etiketten)`
+    : `IDENTE Order #${order.order_number} - ${labels.length} Etikett${labels.length > 1 ? 'en' : ''}`;
+
   await transporter.sendMail({
     from: process.env.EMAIL_USER,
     to: process.env.LABEL_EMAIL || process.env.EMAIL_USER,
-    subject: `IDENTE Order #${order.order_number} - ${labels.length} Etikett${labels.length > 1 ? 'en' : ''}`,
-    html: `<h2>Neue Order!</h2><p>Order: #${order.order_number}</p><p>Kunde: ${order.customer?.first_name || ''} ${order.customer?.last_name || ''}</p><p>Etiketten: ${labels.length}</p>`,
+    subject: subject,
+    html: `
+      <h2>Neue ${isBundle ? 'TRIO BUNDLE ' : ''}Order!</h2>
+      <p><strong>Order:</strong> #${order.order_number}</p>
+      <p><strong>Kunde:</strong> ${order.customer?.first_name || ''} ${order.customer?.last_name || ''}</p>
+      <p><strong>Etiketten:</strong> ${labels.length}</p>
+      ${isBundle ? '<p style="color: #c5a059; font-weight: bold;">⚠️ TRIO BUNDLE - 3 separate Etiketten im Anhang!</p>' : ''}
+      <hr>
+      <p style="font-size: 12px; color: #666;">Generiert von IDENTÉ Label System</p>
+    `,
     attachments: labels
   });
 }
