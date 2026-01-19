@@ -161,7 +161,7 @@ async function generateLabelPDF(data) {
   
   // Tall narrow label format (like the example)
   const pageWidth = 250;
-  const pageHeight = 500;
+  const pageHeight = 600;
   
   const black = rgb(0, 0, 0);
   const gray = rgb(0.3, 0.3, 0.3);
