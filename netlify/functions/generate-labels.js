@@ -5,6 +5,12 @@
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 const nodemailer = require('nodemailer');
 const QRCode = require('qrcode');
+const crypto = require('crypto');
+
+// Optional dependency: when Netlify Blobs is unavailable (local runs, missing
+// context) the webhook still processes, just without dedupe (fail-open).
+let netlifyBlobs = null;
+try { netlifyBlobs = require('@netlify/blobs'); } catch (e) { /* fail-open */ }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FRAGRANCE NOTES DATABASE (60 Notes)
@@ -163,7 +169,7 @@ function generatePersonalizedFormula(quizTags, concentration = 22, seed = 0) {
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════════════════
 
-exports.handler = async (event, context) => {
+const processWebhook = async (event, context) => {
   try {
     console.log('🔔 Webhook received');
     const order = JSON.parse(event.body);
@@ -361,6 +367,105 @@ exports.handler = async (event, context) => {
     console.error('❌ Error:', error);
     return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
   }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WEBHOOK IDEMPOTENCY (Netlify Blobs)
+// ═══════════════════════════════════════════════════════════════════════════
+// Shopify retries webhooks aggressively (including near-parallel duplicates).
+// A persistent lease per X-Shopify-Webhook-Id makes sure each webhook produces
+// exactly one production email:
+//   - no record            -> acquire lease atomically (onlyIfNew) and process
+//   - status "done"        -> 200, no side effects
+//   - fresh "processing"   -> 409 so Shopify retries later (covers the case
+//                             where the concurrent attempt ends up failing)
+//   - stale "processing"   -> take over atomically via etag CAS (onlyIfMatch)
+//   - processing failed    -> record is deleted, the next retry runs again
+// If Blobs is unreachable we process WITHOUT dedupe: a duplicate email is
+// recoverable, a silently dropped order is not.
+
+const LEASE_MS = 10 * 60 * 1000;    // stale takeover after 10 min (fn timeout is far lower)
+const IDEMPOTENCY_STORE = 'webhook-idempotency';
+
+function idempotencyKey(event) {
+  const headers = event.headers || {};
+  const id = headers['x-shopify-webhook-id'] || headers['X-Shopify-Webhook-Id'];
+  if (id) return 'wh-' + id;
+  // No header (e.g. manual replay): fall back to a digest of the payload
+  return 'body-' + crypto.createHash('sha256').update(event.body || '').digest('hex').slice(0, 32);
+}
+
+function getIdempotencyStore(event) {
+  if (!netlifyBlobs) return null;
+  try {
+    if (typeof netlifyBlobs.connectLambda === 'function' && event && event.blobs) {
+      netlifyBlobs.connectLambda(event);
+    }
+    // No 'strong' consistency: the Lambda context has no uncachedEdgeURL, so
+    // strong reads throw at runtime. Correctness relies on the conditional
+    // writes (onlyIfNew / onlyIfMatch), which are evaluated atomically at the
+    // origin regardless of read consistency - a stale read can only turn a
+    // duplicate's response into a 409 retry, never into a second processing.
+    return netlifyBlobs.getStore({ name: IDEMPOTENCY_STORE });
+  } catch (e) {
+    console.log('Idempotency store unavailable, processing without dedupe:', e.message);
+    return null;
+  }
+}
+
+// Returns 'acquired' | 'done' | 'in-progress'
+async function acquireLease(store, key) {
+  const lease = JSON.stringify({ status: 'processing', at: Date.now() });
+  const fresh = await store.set(key, lease, { onlyIfNew: true });
+  if (fresh.modified) return 'acquired';
+
+  const current = await store.getWithMetadata(key, { type: 'json' });
+  if (!current) {
+    // Deleted between the two calls (failed attempt cleanup) - try once more
+    const retry = await store.set(key, lease, { onlyIfNew: true });
+    return retry.modified ? 'acquired' : 'in-progress';
+  }
+  if (current.data && current.data.status === 'done') return 'done';
+  const startedAt = current.data && current.data.at || 0;
+  if (Date.now() - startedAt < LEASE_MS) return 'in-progress';
+  // Stale lease (crashed attempt): take over, but only if nobody else did
+  const takeover = await store.set(key, lease, { onlyIfMatch: current.etag });
+  return takeover.modified ? 'acquired' : 'in-progress';
+}
+
+exports.handler = async (event, context) => {
+  const store = getIdempotencyStore(event);
+  if (!store) return processWebhook(event, context);
+
+  const key = idempotencyKey(event);
+  let state;
+  try {
+    state = await acquireLease(store, key);
+  } catch (e) {
+    console.log('Idempotency check failed, processing without dedupe:', e.message);
+    return processWebhook(event, context);
+  }
+
+  if (state === 'done') {
+    console.log(`Duplicate webhook ${key} ignored (already processed)`);
+    return { statusCode: 200, body: JSON.stringify({ message: 'Duplicate webhook ignored', key }) };
+  }
+  if (state === 'in-progress') {
+    console.log(`Webhook ${key} already being processed, asking Shopify to retry`);
+    return { statusCode: 409, body: JSON.stringify({ message: 'Webhook is being processed, retry later', key }) };
+  }
+
+  const result = await processWebhook(event, context);
+  try {
+    if (result && result.statusCode === 200) {
+      await store.setJSON(key, { status: 'done', at: Date.now() });
+    } else {
+      await store.delete(key);            // failed attempt: let the retry run
+    }
+  } catch (e) {
+    console.log('Idempotency finalize failed (worst case: one duplicate retry):', e.message);
+  }
+  return result;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -687,4 +792,4 @@ async function sendEmail(order, labels) {
 }
 
 // Exposed for local testing only - not used by the webhook path
-exports._test = { generatePersonalizedFormula, generateLabelPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum };
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook };
