@@ -401,7 +401,12 @@ function getIdempotencyStore(event) {
     if (typeof netlifyBlobs.connectLambda === 'function' && event && event.blobs) {
       netlifyBlobs.connectLambda(event);
     }
-    return netlifyBlobs.getStore({ name: IDEMPOTENCY_STORE, consistency: 'strong' });
+    // No 'strong' consistency: the Lambda context has no uncachedEdgeURL, so
+    // strong reads throw at runtime. Correctness relies on the conditional
+    // writes (onlyIfNew / onlyIfMatch), which are evaluated atomically at the
+    // origin regardless of read consistency - a stale read can only turn a
+    // duplicate's response into a 409 retry, never into a second processing.
+    return netlifyBlobs.getStore({ name: IDEMPOTENCY_STORE });
   } catch (e) {
     console.log('Idempotency store unavailable, processing without dedupe:', e.message);
     return null;
@@ -414,7 +419,7 @@ async function acquireLease(store, key) {
   const fresh = await store.set(key, lease, { onlyIfNew: true });
   if (fresh.modified) return 'acquired';
 
-  const current = await store.getWithMetadata(key, { type: 'json', consistency: 'strong' });
+  const current = await store.getWithMetadata(key, { type: 'json' });
   if (!current) {
     // Deleted between the two calls (failed attempt cleanup) - try once more
     const retry = await store.set(key, lease, { onlyIfNew: true });
