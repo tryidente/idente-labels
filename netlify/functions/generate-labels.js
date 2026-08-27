@@ -208,7 +208,7 @@ exports.handler = async (event, context) => {
         let mainFormula;
         try {
           if (props._quiz_main_formula) {
-            mainFormula = JSON.parse(props._quiz_main_formula);
+            mainFormula = usableFormula(JSON.parse(props._quiz_main_formula)) || generatePersonalizedFormula(quizTags, concentration, 0);
           } else {
             mainFormula = generatePersonalizedFormula(quizTags, concentration, 0);
           }
@@ -239,7 +239,7 @@ exports.handler = async (event, context) => {
         let rec1Formula;
         try {
           if (props._quiz_rec1_formula) {
-            rec1Formula = JSON.parse(props._quiz_rec1_formula);
+            rec1Formula = usableFormula(JSON.parse(props._quiz_rec1_formula)) || generatePersonalizedFormula(quizTags, concentration, 1);
           } else {
             rec1Formula = generatePersonalizedFormula(quizTags, concentration, 1);
           }
@@ -270,7 +270,7 @@ exports.handler = async (event, context) => {
         let rec2Formula;
         try {
           if (props._quiz_rec2_formula) {
-            rec2Formula = JSON.parse(props._quiz_rec2_formula);
+            rec2Formula = usableFormula(JSON.parse(props._quiz_rec2_formula)) || generatePersonalizedFormula(quizTags, concentration, 2);
           } else {
             rec2Formula = generatePersonalizedFormula(quizTags, concentration, 2);
           }
@@ -319,14 +319,14 @@ exports.handler = async (event, context) => {
         let formula;
         if (props._quiz_formula) {
           try {
-            const parsedFormula = JSON.parse(props._quiz_formula);
-            if (parsedFormula.top && parsedFormula.top[0] && parsedFormula.top[0].weight) {
+            const usable = usableFormula(JSON.parse(props._quiz_formula));
+            if (usable) {
               formula = {
-                top: parsedFormula.top,
-                heart: parsedFormula.heart,
-                base: parsedFormula.base,
-                oilTotal: parsedFormula.oilTotal || 50 * (quizData.concentration / 100),
-                alcoholTotal: parsedFormula.alcoholTotal || 50 - (50 * (quizData.concentration / 100)),
+                top: usable.top,
+                heart: usable.heart,
+                base: usable.base,
+                oilTotal: 50 * (quizData.concentration / 100),
+                alcoholTotal: 50 - (50 * (quizData.concentration / 100)),
                 grandTotal: 50
               };
             } else {
@@ -381,143 +381,275 @@ function getShortProfileName(profile) {
   return profile.replace(/^IDENT[EÉ]\s*/i, '');
 }
 
+// pdf-lib standard fonts only encode WinAnsi; anything else (Ş, Cyrillic,
+// emoji, decomposed accents) throws and kills the whole order. Normalize to
+// NFC, keep encodable chars, fold the rest to their base letter, drop leftovers.
+const WINANSI_EXTRA = String.fromCharCode(
+  0x20AC, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030,
+  0x0160, 0x2039, 0x0152, 0x017D, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+  0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x017E, 0x0178
+);
+function sanitizeWinAnsi(str) {
+  if (!str) return '';
+  const ok = c => {
+    const p = c.codePointAt(0);
+    return (p >= 0x20 && p <= 0x7E) || (p >= 0xA0 && p <= 0xFF) || WINANSI_EXTRA.includes(c);
+  };
+  let out = '';
+  for (const c of String(str).normalize('NFC')) {
+    if (ok(c)) { out += c; continue; }
+    for (const d of c.normalize('NFKD')) {
+      if (ok(d)) { out += d; break; }
+    }
+  }
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+// Validates a theme-provided formula before it reaches the label: three note
+// arrays, every weight a finite positive number, 3-20 notes total (more than
+// 20 cannot fit the 70mm panel). Returns a normalized copy, or null so the
+// caller falls back to generatePersonalizedFormula instead of printing garbage.
+function usableFormula(f) {
+  if (!f || typeof f !== 'object') return null;
+  const norm = {};
+  let count = 0;
+  for (const key of ['top', 'heart', 'base']) {
+    const notes = Array.isArray(f[key]) ? f[key] : [];
+    const out = [];
+    for (const n of notes) {
+      const w = Number(n && n.weight);
+      if (!n || typeof n.name !== 'string' || !n.name.trim() || !isFinite(w) || w <= 0) return null;
+      out.push({ name: n.name, weight: w });
+      count++;
+    }
+    norm[key] = out;
+  }
+  if (count < 3 || count > 20) return null;
+  return norm;
+}
+
+// Draws text with letterspacing (tracking). Standard fonts have no tracking,
+// so each glyph is placed individually. Returns nothing; pass centerX to center.
+function drawTracked(page, text, { y, size, font, tracking, centerX, x, color }) {
+  const chars = [...text];
+  let width = 0;
+  chars.forEach(c => { width += font.widthOfTextAtSize(c, size) + tracking; });
+  width -= tracking;
+  let cx = centerX !== undefined ? centerX - width / 2 : x;
+  chars.forEach(c => {
+    page.drawText(c, { x: cx, y, size, font, color });
+    cx += font.widthOfTextAtSize(c, size) + tracking;
+  });
+}
+
+function trackedWidth(text, font, size, tracking) {
+  let width = 0;
+  [...text].forEach(c => { width += font.widthOfTextAtSize(c, size) + tracking; });
+  return width - tracking;
+}
+
+// Rounds weights to 2 decimals so the printed values sum EXACTLY to the
+// printed group total (largest-remainder method). 0.01g is also the realistic
+// precision of a production scale, so the label stays honest.
+function roundPreservingSum(values) {
+  const target = Math.round(values.reduce((s, v) => s + v, 0) * 100);
+  const floored = values.map(v => Math.floor(v * 100));
+  let remainder = target - floored.reduce((s, v) => s + v, 0);
+  const order = values
+    .map((v, i) => ({ i, frac: v * 100 - Math.floor(v * 100) }))
+    .sort((a, b) => b.frac - a.frac);
+  for (let k = 0; k < order.length && remainder > 0; k++, remainder--) {
+    floored[order[k].i] += 1;
+  }
+  return floored.map(v => v / 100);
+}
+
+// ── Physical label spec ──────────────────────────────────────────────────────
+// One square 70x70mm metallic-silver label that wraps around the bottle edge.
+// The flakon body is 37x37mm, so the fold sits at 37mm: left 37mm panel = front
+// face (edge to edge), right 33mm panel wraps onto the second face.
+// Printed black only — unprinted areas stay silver (QR light modules are
+// transparent for the same reason). Adjust FOLD_MM if the bottle changes.
+const MM = 2.83465;
+const LABEL_MM = 70;
+const FOLD_MM = 37;
+
 async function generateLabelPDF(data, formula) {
-  console.log(`🎨 Generating PDF for ${data.name} - ${data.profile}`);
+  console.log(`Generating PDF for ${data.name} - ${data.profile}`);
 
   const pdfDoc = await PDFDocument.create();
   const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  
-  const pageWidth = 170;
-  const pageHeight = 425;
+  const courier = await pdfDoc.embedFont(StandardFonts.Courier);
+  const courierBold = await pdfDoc.embedFont(StandardFonts.CourierBold);
+
+  const pageSize = LABEL_MM * MM;                 // 198.4pt
+  const fold = FOLD_MM * MM;                      // 104.9pt
   const black = rgb(0, 0, 0);
-  const centerX = pageWidth / 2;
-  const profileName = getShortProfileName(data.profile);
-  const noteCount = formula.top.length + formula.heart.length + formula.base.length;
+  const ellipsis = String.fromCharCode(0x2026);
+  // Display copies are WinAnsi-sanitized so drawing can never throw; the QR
+  // keeps the raw values so the verify page shows the name exactly as entered.
+  const dispName = sanitizeWinAnsi(data.name);
+  const dispBatch = sanitizeWinAnsi(String(data.batch));
+  const dispDate = sanitizeWinAnsi(String(data.date));
+  const profileName = sanitizeWinAnsi(getShortProfileName(data.profile)).toUpperCase();
+  const top = formula.top || [];
+  const heart = formula.heart || [];
+  const base = formula.base || [];
+  const noteCount = top.length + heart.length + base.length;
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PAGE 1: FRONT LABEL
-  // ═══════════════════════════════════════════════════════════════════════════
-  const page1 = pdfDoc.addPage([pageWidth, pageHeight]);
-  let y = pageHeight - 70;
+  const page = pdfDoc.addPage([pageSize, pageSize]);
 
-  // IDENTÉ Logo
-  const letters = ['I', 'D', 'E', 'N', 'T', 'E'];
-  const logoSize = 28;
-  const letterSpacing = 5;
-  let totalLogoWidth = 0;
-  letters.forEach(l => { totalLogoWidth += helveticaBold.widthOfTextAtSize(l, logoSize) + letterSpacing; });
-  totalLogoWidth -= letterSpacing;
-  
-  let letterX = centerX - totalLogoWidth / 2;
-  letters.forEach(letter => {
-    page1.drawText(letter, { x: letterX, y, size: logoSize, font: helveticaBold, color: black });
-    letterX += helveticaBold.widthOfTextAtSize(letter, logoSize) + letterSpacing;
-  });
+  // ═════════════════════════════════════════════════════════════════════════
+  // LEFT PANEL: FRONT
+  // ═════════════════════════════════════════════════════════════════════════
+  const frontCX = fold / 2;
+  const frontMax = fold - 2 * (3.5 * MM);         // keep clear of edge and fold
 
-  y -= 12;
-  page1.drawLine({ start: { x: 18, y }, end: { x: pageWidth - 18, y }, thickness: 1.2, color: black });
+  // Wordmark — fit incl. tracking
+  let logoSize = 18;
+  const logoTracking = 3;
+  while (logoSize > 10 && trackedWidth('IDENTÉ', helveticaBold, logoSize, logoTracking) > frontMax) logoSize -= 0.5;
+  drawTracked(page, 'IDENTÉ', { y: 164, size: logoSize, font: helveticaBold, tracking: logoTracking, centerX: frontCX, color: black });
 
-  y -= 30;
-  const forText = `for ${data.name}`;
-  page1.drawText(forText, { x: centerX - helvetica.widthOfTextAtSize(forText, 15) / 2, y, size: 15, font: helvetica, color: black });
-
-  // Bottom section
-  y = 115;
-  if (profileName) {
-    page1.drawText(profileName, { x: centerX - helveticaBold.widthOfTextAtSize(profileName, 13) / 2, y, size: 13, font: helveticaBold, color: black });
-    y -= 22;
+  // for {Name} — shrink to fit, then hard-truncate so the floor size can
+  // never spill across the fold or off the page
+  if (dispName) {
+    let forText = `for ${dispName}`;
+    let forSize = 7.5;
+    while (forSize > 4.5 && helvetica.widthOfTextAtSize(forText, forSize) > frontMax) forSize -= 0.25;
+    if (helvetica.widthOfTextAtSize(forText, forSize) > frontMax) {
+      while (forText.length > 5 && helvetica.widthOfTextAtSize(forText + ellipsis, forSize) > frontMax) forText = forText.slice(0, -1);
+      forText += ellipsis;
+    }
+    page.drawText(forText, { x: frontCX - helvetica.widthOfTextAtSize(forText, forSize) / 2, y: 151, size: forSize, font: helvetica, color: black });
   }
 
-  // PARFUM
-  const parfumText = 'PARFUM';
-  const parfumSize = 13;
-  const parfumSpacing = 5;
-  let parfumWidth = 0;
-  parfumText.split('').forEach(l => { parfumWidth += helveticaBold.widthOfTextAtSize(l, parfumSize) + parfumSpacing; });
-  parfumWidth -= parfumSpacing;
-  let parfumX = centerX - parfumWidth / 2;
-  parfumText.split('').forEach(letter => {
-    page1.drawText(letter, { x: parfumX, y, size: parfumSize, font: helveticaBold, color: black });
-    parfumX += helveticaBold.widthOfTextAtSize(letter, parfumSize) + parfumSpacing;
+  // Profile name, center of the panel — shrink to fit incl. tracking,
+  // then hard-truncate at the floor size
+  if (profileName) {
+    let profDraw = profileName;
+    let profSize = 12;
+    const profTracking = 2.5;
+    while (profSize > 5.5 && trackedWidth(profDraw, helveticaBold, profSize, profTracking) > frontMax) profSize -= 0.25;
+    if (trackedWidth(profDraw, helveticaBold, profSize, profTracking) > frontMax) {
+      while (profDraw.length > 2 && trackedWidth(profDraw + ellipsis, helveticaBold, profSize, profTracking) > frontMax) profDraw = profDraw.slice(0, -1);
+      profDraw += ellipsis;
+    }
+    drawTracked(page, profDraw, { y: 102, size: profSize, font: helveticaBold, tracking: profTracking, centerX: frontCX, color: black });
+  }
+
+  // Tagline
+  drawTracked(page, 'PERSONAL FRAGRANCE', { y: 91, size: 4.2, font: helvetica, tracking: 0.9, centerX: frontCX, color: black });
+  drawTracked(page, 'COMPOSED FOR YOU', { y: 84.5, size: 4.2, font: helvetica, tracking: 0.9, centerX: frontCX, color: black });
+
+  // PARFUM + specs
+  drawTracked(page, 'PARFUM', { y: 38, size: 9, font: helveticaBold, tracking: 3.5, centerX: frontCX, color: black });
+  drawTracked(page, `${noteCount} NOTES - ${data.concentration}%`, { y: 27, size: 5.2, font: helvetica, tracking: 0.7, centerX: frontCX, color: black });
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // RIGHT PANEL: FORMULA — lab sheet in Courier with dot leaders
+  // ═════════════════════════════════════════════════════════════════════════
+  const leftMargin = fold + 2 * MM;               // clear of the fold
+  const rightMargin = pageSize - 2.5 * MM;
+  const colWidth = rightMargin - leftMargin;
+
+  // Print-rounded weights: per group they sum exactly to the printed subtotal,
+  // and the subtotals sum exactly to the printed oil total.
+  const groups = [
+    { title: 'TOP NOTES', notes: top },
+    { title: 'HEART NOTES', notes: heart },
+    { title: 'BASE NOTES', notes: base }
+  ].filter(g => g.notes.length > 0);
+
+  let oilDisplay = 0;
+  groups.forEach(g => {
+    const rounded = roundPreservingSum(g.notes.map(n => Number(n.weight) || 0));
+    g.display = g.notes.map((n, i) => ({ name: sanitizeWinAnsi(n.name), weight: rounded[i] }));
+    oilDisplay += rounded.reduce((s, v) => s + v, 0);
   });
+  oilDisplay = Math.round(oilDisplay * 100) / 100;
+  const grandTotal = formula.grandTotal || 50;
+  const alcoholDisplay = Math.round((grandTotal - oilDisplay) * 100) / 100;
 
-  y -= 24;
-  const specsText = `${noteCount} NOTES \u2022 ${data.concentration}%`;
-  page1.drawText(specsText, { x: centerX - helvetica.widthOfTextAtSize(specsText, 11) / 2, y, size: 11, font: helvetica, color: black });
+  // Vertical layout: pick the largest row leading that still fits the panel.
+  // Mirrors the y-walk below: contentStart - groups - totals must leave the
+  // batch block (batchY >= 25) above the bottom edge.
+  const contentStart = pageSize - 24;             // first group-header baseline
+  const totalsConsumed = 28;                      // rules + oil + alcohol rows
+  const minBatchY = 25;                           // BATCH/date/50ml + QR fit below
+  let leading = 6.5;
+  const groupsConsumed = l => groups.length * (l + 2) + noteCount * l;
+  while (leading > 4.6 && contentStart - groupsConsumed(leading) - totalsConsumed < minBatchY) {
+    leading = Math.round((leading - 0.1) * 10) / 10;
+  }
 
-  y -= 35;
-  page1.drawText('id.', { x: centerX - helvetica.widthOfTextAtSize('id.', 11) / 2, y, size: 11, font: helvetica, color: black });
+  // Capped at 4.9 so the column fits 18-char note names next to the usual
+  // 5-char weights; longer values shorten the name instead of overflowing
+  const noteSize = Math.min(4.9, Math.round(leading * 0.82 * 10) / 10);
+  const charW = courier.widthOfTextAtSize('0', noteSize);
+  const cols = Math.floor(colWidth / charW);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PAGE 2: FORMULA
-  // ═══════════════════════════════════════════════════════════════════════════
-  const page2 = pdfDoc.addPage([pageWidth, pageHeight]);
-  y = pageHeight - 35;
-  const leftMargin = 14;
-  const rightMargin = pageWidth - 14;
-
-  page2.drawText('FORMULA', { x: centerX - helveticaBold.widthOfTextAtSize('FORMULA', 24) / 2, y, size: 24, font: helveticaBold, color: black });
-  y -= 10;
-  page2.drawLine({ start: { x: leftMargin, y }, end: { x: rightMargin, y }, thickness: 1.5, color: black });
-  y -= 20;
-
-  const drawNoteGroup = (title, notes) => {
-    if (!notes || notes.length === 0) return;
-    page2.drawText(title, { x: leftMargin, y, size: 10, font: helveticaBold, color: black });
-    y -= 14;
-    notes.forEach(note => {
-      page2.drawText(note.name, { x: leftMargin + 6, y, size: 9, font: helvetica, color: black });
-      const wt = `${note.weight.toFixed(3)}g`;
-      page2.drawText(wt, { x: rightMargin - helvetica.widthOfTextAtSize(wt, 9), y, size: 9, font: helvetica, color: black });
-      y -= 12;
-    });
-    y -= 6;
+  const dashedRule = (yy) => {
+    page.drawText('-'.repeat(cols), { x: leftMargin, y: yy, size: noteSize, font: courier, color: black });
   };
 
-  drawNoteGroup('TOP NOTES', formula.top);
-  drawNoteGroup('HEART NOTES', formula.heart);
-  drawNoteGroup('BASE NOTES', formula.base);
+  // Builds "Name ...... 1.20g" padded to the full column width
+  const leaderRow = (name, value) => {
+    let n = name;
+    const maxName = cols - value.length - 4;      // keep at least 2 dots + 2 spaces
+    if (n.length > maxName) n = n.slice(0, maxName);
+    const dots = '.'.repeat(Math.max(2, cols - n.length - value.length - 2));
+    return `${n} ${dots} ${value}`;
+  };
 
-  y -= 4;
-  page2.drawLine({ start: { x: leftMargin, y }, end: { x: rightMargin, y }, thickness: 1, color: black });
-  y -= 16;
+  let y = pageSize - 10;
+  drawTracked(page, 'FORMULA', { y, size: 6.5, font: courierBold, tracking: 1.8, x: leftMargin, color: black });
+  y -= 5;
+  dashedRule(y);
+  y -= 9;                                          // y is now contentStart
 
-  page2.drawText('Perfume oil', { x: leftMargin, y, size: 10, font: helvetica, color: black });
-  const oilT = `${formula.oilTotal.toFixed(3)}g`;
-  page2.drawText(oilT, { x: rightMargin - helvetica.widthOfTextAtSize(oilT, 10), y, size: 10, font: helvetica, color: black });
-  y -= 14;
+  groups.forEach(g => {
+    page.drawText(g.title, { x: leftMargin, y, size: noteSize + 0.4, font: courierBold, color: black });
+    y -= leading;
+    g.display.forEach(note => {
+      page.drawText(leaderRow(note.name, `${note.weight.toFixed(2)}g`), { x: leftMargin, y, size: noteSize, font: courier, color: black });
+      y -= leading;
+    });
+    y -= 2;
+  });
 
-  page2.drawText('Alcohol', { x: leftMargin, y, size: 10, font: helvetica, color: black });
-  const alcT = `${formula.alcoholTotal.toFixed(3)}g`;
-  page2.drawText(alcT, { x: rightMargin - helvetica.widthOfTextAtSize(alcT, 10), y, size: 10, font: helvetica, color: black });
-  y -= 12;
+  // Totals — decrements sum to totalsConsumed above
+  dashedRule(y);
+  y -= 7;
+  page.drawText(leaderRow('Perfume oil', `${oilDisplay.toFixed(2)}g`), { x: leftMargin, y, size: noteSize, font: courierBold, color: black });
+  y -= 7.5;
+  page.drawText(leaderRow('Alcohol', `${alcoholDisplay.toFixed(2)}g`), { x: leftMargin, y, size: noteSize, font: courierBold, color: black });
+  y -= 5.5;
+  dashedRule(y);
+  y -= 8;
 
-  page2.drawLine({ start: { x: leftMargin, y }, end: { x: rightMargin, y }, thickness: 1, color: black });
-  y -= 16;
-
-  page2.drawText('Total', { x: leftMargin, y, size: 10, font: helveticaBold, color: black });
-  const totT = `${formula.grandTotal.toFixed(3)}g`;
-  page2.drawText(totT, { x: rightMargin - helveticaBold.widthOfTextAtSize(totT, 10), y, size: 10, font: helveticaBold, color: black });
-  y -= 10;
-  page2.drawLine({ start: { x: leftMargin, y }, end: { x: rightMargin, y }, thickness: 1.5, color: black });
-
-  y -= 25;
+  // Batch block: BATCH + date left, QR right, 50ml below
   const batchY = y;
-  page2.drawText('BATCH', { x: leftMargin, y: batchY, size: 11, font: helveticaBold, color: black });
-  page2.drawText(data.batch, { x: leftMargin, y: batchY - 15, size: 10, font: helvetica, color: black });
-  page2.drawText(data.date, { x: leftMargin, y: batchY - 28, size: 10, font: helvetica, color: black });
-  page2.drawText('50ml', { x: centerX - helvetica.widthOfTextAtSize('50ml', 10) / 2, y: batchY - 15, size: 10, font: helvetica, color: black });
+  const qrSide = 26;
+  const batchText = `BATCH ${dispBatch}`;
+  let batchSize = 5.5;
+  while (batchSize > 4 && courierBold.widthOfTextAtSize(batchText, batchSize) > colWidth - qrSide - 4) batchSize -= 0.1;
+  page.drawText(batchText, { x: leftMargin, y: batchY, size: batchSize, font: courierBold, color: black });
+  page.drawText(dispDate, { x: leftMargin, y: batchY - 8, size: 5.5, font: courierBold, color: black });
 
   try {
     const qrUrl = generateQRUrl(data);
-    const qrDataUrl = await QRCode.toDataURL(qrUrl, { width: 200, margin: 0, errorCorrectionLevel: 'L', color: { dark: '#000000', light: '#ffffff' } });
+    // Transparent light modules: unprinted areas stay metallic silver
+    const qrDataUrl = await QRCode.toDataURL(qrUrl, { width: 300, margin: 0, errorCorrectionLevel: 'L', color: { dark: '#000000ff', light: '#ffffff00' } });
     const qrImageData = qrDataUrl.replace(/^data:image\/png;base64,/, '');
     const qrImage = await pdfDoc.embedPng(Buffer.from(qrImageData, 'base64'));
-    page2.drawImage(qrImage, { x: rightMargin - 48, y: batchY - 35, width: 48, height: 48 });
+    page.drawImage(qrImage, { x: rightMargin - qrSide, y: batchY - qrSide + 6, width: qrSide, height: qrSide });
   } catch (e) {
-    console.log('⚠️ QR failed');
+    console.log('QR failed');
   }
+
+  page.drawText('50ml', { x: leftMargin, y: batchY - 19, size: 6, font: courier, color: black });
 
   return Buffer.from(await pdfDoc.save());
 }
@@ -553,3 +685,6 @@ async function sendEmail(order, labels) {
     attachments: labels
   });
 }
+
+// Exposed for local testing only - not used by the webhook path
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum };
