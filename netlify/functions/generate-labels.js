@@ -169,13 +169,55 @@ function generatePersonalizedFormula(quizTags, concentration = 22, seed = 0) {
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Batch numbers from the theme are numeric strings; a non-numeric base must
+// not turn into "NaN" on bundle labels 2/3, so fall back to a suffix.
+function offsetBatch(baseBatch, offset) {
+  if (offset === 0) return String(baseBatch);
+  if (/^\d+$/.test(String(baseBatch))) return String(parseInt(baseBatch, 10) + offset);
+  return `${baseBatch}-${offset + 1}`;
+}
+
+// Harmonie/Match arrive as strings from line-item properties; a non-numeric
+// value must never print as "NaN" on the label or in the QR payload.
+function toScoreString(value, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) ? String(n) : fallback;
+}
+
+function reducedScore(scoreStr, delta) {
+  const n = parseInt(scoreStr, 10);
+  return String(Math.max(80, (Number.isFinite(n) ? n : 90) - delta));
+}
+
+function fileSafeName(name) {
+  return String(name).replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'Customer';
+}
+
+function resolveFormula(rawFormulaJson, quizTags, concentration, seed) {
+  if (rawFormulaJson) {
+    try {
+      const usable = usableFormula(JSON.parse(rawFormulaJson));
+      if (usable) {
+        const totalOil = 50 * (concentration / 100);
+        return {
+          top: usable.top, heart: usable.heart, base: usable.base,
+          oilTotal: totalOil, alcoholTotal: 50 - totalOil, grandTotal: 50
+        };
+      }
+    } catch (e) { /* fall through to generator */ }
+  }
+  return generatePersonalizedFormula(quizTags, concentration, seed);
+}
+
 const processWebhook = async (event, context) => {
   try {
     console.log('🔔 Webhook received');
-    const order = JSON.parse(event.body);
+    const order = JSON.parse(getRawBody(event).toString('utf8'));
     console.log(`📦 Order #${order.order_number} from ${order.customer?.first_name || 'Customer'}`);
 
     const labels = [];
+    const registryEntries = [];
+    const productionNotes = [];
 
     for (const item of order.line_items) {
       console.log(`📝 Processing item: ${item.name}`);
@@ -188,175 +230,120 @@ const processWebhook = async (event, context) => {
       const props = {};
       item.properties.forEach(p => { props[p.name] = p.value; });
 
-      // ═══════════════════════════════════════════════════════════════════════
-      // CHECK IF BUNDLE OR SINGLE PRODUCT
-      // ═══════════════════════════════════════════════════════════════════════
-      
-      if (props._quiz_type === 'bundle') {
-        console.log('📦 BUNDLE ORDER DETECTED - Generating 3 labels');
-        
-        const baseBatch = props._quiz_batch || String(Date.now()).slice(-8);
-        const customerName = props._quiz_name || order.customer?.first_name || 'Customer';
-        const dateStr = props._quiz_date || new Date().toLocaleDateString('de-DE');
-        const concentration = parseInt(props._quiz_concentration) || 22;
-        const harmonie = props._quiz_harmonie || '95';
-        const match = props._quiz_match || '92';
-        
-        // Parse quiz tags
-        let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
-        try {
-          if (props._quiz_tags) quizTags = JSON.parse(props._quiz_tags);
-        } catch (e) { console.log('⚠️ Could not parse quiz tags'); }
-        
-        // ─────────────────────────────────────────────────────────────────────
-        // LABEL 1: Main Perfume
-        // ─────────────────────────────────────────────────────────────────────
-        let mainFormula;
-        try {
-          if (props._quiz_main_formula) {
-            mainFormula = usableFormula(JSON.parse(props._quiz_main_formula)) || generatePersonalizedFormula(quizTags, concentration, 0);
-          } else {
-            mainFormula = generatePersonalizedFormula(quizTags, concentration, 0);
-          }
-        } catch (e) {
-          mainFormula = generatePersonalizedFormula(quizTags, concentration, 0);
+      const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+      const type = props._quiz_type || 'single';
+      const baseBatch = props._quiz_batch || String(Date.now()).slice(-8);
+      const customerName = props._quiz_name || order.customer?.first_name || 'Customer';
+      const dateStr = props._quiz_date || new Date().toLocaleDateString('de-DE');
+      const concentration = parseInt(props._quiz_concentration) || 22;
+      const harmonie = toScoreString(props._quiz_harmonie, '95');
+      const match = toScoreString(props._quiz_match, '92');
+
+      let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
+      try {
+        if (props._quiz_tags) quizTags = JSON.parse(props._quiz_tags);
+      } catch (e) { console.log('⚠️ Could not parse quiz tags'); }
+
+      if (qty > 1) {
+        productionNotes.push(`Position "${item.name}": Menge ${qty} — Etikett je Einheit ${qty}× drucken.`);
+      }
+
+      if (type === 'bundle' || type === 'duo') {
+        // ═════════════════════════════════════════════════════════════════════
+        // BUNDLE (Trio: 3 labels) / DUO (2 labels) — main + recommendations
+        // ═════════════════════════════════════════════════════════════════════
+        const parts = type === 'bundle'
+          ? [
+              { key: 'main', suffix: 'MAIN', seed: 0, dH: 0, dM: 0 },
+              { key: 'rec1', suffix: 'REC1', seed: 1, dH: 2, dM: 3 },
+              { key: 'rec2', suffix: 'REC2', seed: 2, dH: 4, dM: 5 }
+            ]
+          : [
+              { key: 'main', suffix: 'MAIN', seed: 0, dH: 0, dM: 0 },
+              { key: 'rec1', suffix: 'REC1', seed: 1, dH: 2, dM: 3 }
+            ];
+        console.log(`📦 ${type.toUpperCase()} ORDER DETECTED - Generating ${parts.length} labels`);
+
+        for (let pi = 0; pi < parts.length; pi++) {
+          const part = parts[pi];
+          const formula = resolveFormula(props[`_quiz_${part.key}_formula`], quizTags, concentration, part.seed);
+          const data = {
+            batch: offsetBatch(baseBatch, pi),
+            name: customerName,
+            date: dateStr,
+            profile: props[`_quiz_${part.key}_profile`] || 'IDENTÉ Custom',
+            concentration,
+            harmonie: pi === 0 ? harmonie : reducedScore(harmonie, part.dH),
+            match: pi === 0 ? match : reducedScore(match, part.dM)
+          };
+          const pdf = await generateLabelPDF(data, formula);
+          labels.push({
+            filename: `IDENTE-${fileSafeName(customerName)}-${data.batch}-${part.suffix}.pdf`,
+            content: pdf,
+            qty
+          });
+          registryEntries.push({ batch: data.batch, data, formula, type, qty });
+          console.log(`✅ Label ${pi + 1}/${parts.length} generated: ${data.profile}`);
         }
-        
-        const mainData = {
+
+      } else if (type === 'probe') {
+        // ═════════════════════════════════════════════════════════════════════
+        // PROBE (2 ml sample) — production sheet; the physical sample label
+        // layout is pending real bottle/label dimensions and NOT invented here.
+        // ═════════════════════════════════════════════════════════════════════
+        console.log('🧪 PROBE ORDER DETECTED - Generating 2ml production sheet');
+
+        const data = {
           batch: baseBatch,
           name: customerName,
           date: dateStr,
-          profile: props._quiz_main_profile || 'IDENTÉ Custom',
+          profile: props._quiz_profile || 'IDENTÉ Custom',
           concentration,
           harmonie,
           match
         };
-        
-        const mainPdf = await generateLabelPDF(mainData, mainFormula);
+        const formula = resolveFormula(props._quiz_formula, quizTags, concentration, 0);
+        const pdf = await generateSampleSheetPDF(data, formula);
         labels.push({
-          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${baseBatch}-MAIN.pdf`,
-          content: mainPdf
+          filename: `IDENTE-PROBE-${fileSafeName(customerName)}-${data.batch}.pdf`,
+          content: pdf,
+          qty
         });
-        console.log(`✅ Label 1/3 generated: ${mainData.profile}`);
-        
-        // ─────────────────────────────────────────────────────────────────────
-        // LABEL 2: First Recommendation
-        // ─────────────────────────────────────────────────────────────────────
-        let rec1Formula;
-        try {
-          if (props._quiz_rec1_formula) {
-            rec1Formula = usableFormula(JSON.parse(props._quiz_rec1_formula)) || generatePersonalizedFormula(quizTags, concentration, 1);
-          } else {
-            rec1Formula = generatePersonalizedFormula(quizTags, concentration, 1);
-          }
-        } catch (e) {
-          rec1Formula = generatePersonalizedFormula(quizTags, concentration, 1);
-        }
-        
-        const rec1Data = {
-          batch: String(parseInt(baseBatch) + 1),
-          name: customerName,
-          date: dateStr,
-          profile: props._quiz_rec1_profile || 'IDENTÉ Custom',
-          concentration,
-          harmonie: String(Math.max(80, parseInt(harmonie) - 2)),
-          match: String(Math.max(80, parseInt(match) - 3))
-        };
-        
-        const rec1Pdf = await generateLabelPDF(rec1Data, rec1Formula);
-        labels.push({
-          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${rec1Data.batch}-REC1.pdf`,
-          content: rec1Pdf
-        });
-        console.log(`✅ Label 2/3 generated: ${rec1Data.profile}`);
-        
-        // ─────────────────────────────────────────────────────────────────────
-        // LABEL 3: Second Recommendation
-        // ─────────────────────────────────────────────────────────────────────
-        let rec2Formula;
-        try {
-          if (props._quiz_rec2_formula) {
-            rec2Formula = usableFormula(JSON.parse(props._quiz_rec2_formula)) || generatePersonalizedFormula(quizTags, concentration, 2);
-          } else {
-            rec2Formula = generatePersonalizedFormula(quizTags, concentration, 2);
-          }
-        } catch (e) {
-          rec2Formula = generatePersonalizedFormula(quizTags, concentration, 2);
-        }
-        
-        const rec2Data = {
-          batch: String(parseInt(baseBatch) + 2),
-          name: customerName,
-          date: dateStr,
-          profile: props._quiz_rec2_profile || 'IDENTÉ Custom',
-          concentration,
-          harmonie: String(Math.max(80, parseInt(harmonie) - 4)),
-          match: String(Math.max(80, parseInt(match) - 5))
-        };
-        
-        const rec2Pdf = await generateLabelPDF(rec2Data, rec2Formula);
-        labels.push({
-          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${rec2Data.batch}-REC2.pdf`,
-          content: rec2Pdf
-        });
-        console.log(`✅ Label 3/3 generated: ${rec2Data.profile}`);
-        
+        registryEntries.push({ batch: data.batch, data, formula, type, qty });
+        productionNotes.push(`PROBE 2 ml (Batch ${data.batch}): Produktionsblatt im Anhang. Physisches Sample-Etikett: Layout ausstehend (Fläschchen-Maße offen).`);
+
       } else {
-        // ═══════════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════════
         // SINGLE PRODUCT ORDER
-        // ═══════════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════════
         console.log('📝 SINGLE ORDER - Generating 1 label');
-        
+
         const quizData = {
-          batch: props._quiz_batch || String(Date.now()).slice(-8),
-          name: props._quiz_name || order.customer?.first_name || 'Customer',
-          date: props._quiz_date || new Date().toLocaleDateString('de-DE'),
+          batch: baseBatch,
+          name: customerName,
+          date: dateStr,
           profile: props._quiz_profile || 'IDENTÉ Custom',
-          concentration: parseInt(props._quiz_concentration) || 22,
-          harmonie: props._quiz_harmonie || '95',
-          match: props._quiz_match || '92'
+          concentration,
+          harmonie,
+          match
         };
-
-        let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
-        try {
-          if (props._quiz_tags) quizTags = JSON.parse(props._quiz_tags);
-        } catch (e) { console.log('⚠️ Could not parse quiz tags'); }
-
-        let formula;
-        if (props._quiz_formula) {
-          try {
-            const usable = usableFormula(JSON.parse(props._quiz_formula));
-            if (usable) {
-              formula = {
-                top: usable.top,
-                heart: usable.heart,
-                base: usable.base,
-                oilTotal: 50 * (quizData.concentration / 100),
-                alcoholTotal: 50 - (50 * (quizData.concentration / 100)),
-                grandTotal: 50
-              };
-            } else {
-              formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
-            }
-          } catch (e) {
-            formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
-          }
-        } else {
-          formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
-        }
-
+        const formula = resolveFormula(props._quiz_formula, quizTags, concentration, 0);
         const pdf = await generateLabelPDF(quizData, formula);
         labels.push({
-          filename: `IDENTE-${quizData.name.replace(/\s/g, '-')}-${quizData.batch}.pdf`,
-          content: pdf
+          filename: `IDENTE-${fileSafeName(quizData.name)}-${quizData.batch}.pdf`,
+          content: pdf,
+          qty
         });
+        registryEntries.push({ batch: quizData.batch, data: quizData, formula, type: 'single', qty });
         console.log(`✅ Single label generated: ${quizData.profile}`);
       }
     }
 
     if (labels.length > 0) {
       console.log(`📧 Sending ${labels.length} labels via email`);
-      await sendEmail(order, labels);
+      await sendEmail(order, labels, productionNotes);
+      // Best effort, never fails the webhook: archive PDFs + formula snapshots
+      await persistArtifacts(event, order, labels, registryEntries);
       console.log('✅ Success!');
     } else {
       console.log('⚠️ No labels generated');
@@ -387,12 +374,40 @@ const processWebhook = async (event, context) => {
 const LEASE_MS = 10 * 60 * 1000;    // stale takeover after 10 min (fn timeout is far lower)
 const IDEMPOTENCY_STORE = 'webhook-idempotency';
 
+// Netlify may deliver the body base64-encoded; HMAC must be computed over the
+// exact raw bytes Shopify signed, and JSON.parse must see the same bytes.
+function getRawBody(event) {
+  if (!event || !event.body) return Buffer.alloc(0);
+  return event.isBase64Encoded ? Buffer.from(event.body, 'base64') : Buffer.from(event.body, 'utf8');
+}
+
+// Shopify webhook HMAC verification. Enforced only when SHOPIFY_WEBHOOK_SECRET
+// is set, so the function keeps working until the secret is configured in both
+// Shopify and Netlify; once set, forged requests are rejected before any
+// side effect (email, blobs, PDF work).
+function verifyShopifyHmac(event) {
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  if (!secret) return { ok: true, enforced: false };
+  const headers = event.headers || {};
+  const given = headers['x-shopify-hmac-sha256'] || headers['X-Shopify-Hmac-Sha256'];
+  if (!given) return { ok: false, enforced: true };
+  const digest = crypto.createHmac('sha256', secret).update(getRawBody(event)).digest('base64');
+  const a = Buffer.from(digest);
+  const b = Buffer.from(String(given));
+  if (a.length !== b.length) return { ok: false, enforced: true };
+  try {
+    return { ok: crypto.timingSafeEqual(a, b), enforced: true };
+  } catch (e) {
+    return { ok: false, enforced: true };
+  }
+}
+
 function idempotencyKey(event) {
   const headers = event.headers || {};
   const id = headers['x-shopify-webhook-id'] || headers['X-Shopify-Webhook-Id'];
   if (id) return 'wh-' + id;
   // No header (e.g. manual replay): fall back to a digest of the payload
-  return 'body-' + crypto.createHash('sha256').update(event.body || '').digest('hex').slice(0, 32);
+  return 'body-' + crypto.createHash('sha256').update(getRawBody(event)).digest('hex').slice(0, 32);
 }
 
 function getIdempotencyStore(event) {
@@ -434,6 +449,15 @@ async function acquireLease(store, key) {
 }
 
 exports.handler = async (event, context) => {
+  const hmac = verifyShopifyHmac(event);
+  if (!hmac.ok) {
+    console.log('🚫 Webhook HMAC verification failed - rejecting');
+    return { statusCode: 401, body: JSON.stringify({ error: 'Invalid webhook signature' }) };
+  }
+  if (!hmac.enforced) {
+    console.log('⚠️ SHOPIFY_WEBHOOK_SECRET not set - HMAC verification skipped');
+  }
+
   const store = getIdempotencyStore(event);
   if (!store) return processWebhook(event, context);
 
@@ -760,36 +784,195 @@ async function generateLabelPDF(data, formula) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SAMPLE PRODUCTION SHEET (2 ml Probe)
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal A6 production document for 2ml samples. This is deliberately NOT a
+// bottle label: the physical sample label needs the real vial/label dimensions
+// (still unknown) and must not be guessed. The sheet states the formula as
+// percentages of the oil concentrate plus the reference 50ml weights, and
+// leaves the batching decision (concentrate size) to production.
+
+async function generateSampleSheetPDF(data, formula) {
+  console.log(`Generating 2ml sample sheet for ${data.name} - ${data.profile}`);
+
+  const pdfDoc = await PDFDocument.create();
+  const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const courier = await pdfDoc.embedFont(StandardFonts.Courier);
+  const courierBold = await pdfDoc.embedFont(StandardFonts.CourierBold);
+
+  const W = 105 * MM, H = 148 * MM;               // A6 portrait
+  const black = rgb(0, 0, 0);
+  const margin = 8 * MM;
+  const page = pdfDoc.addPage([W, H]);
+
+  const dispName = sanitizeWinAnsi(data.name);
+  const dispBatch = sanitizeWinAnsi(String(data.batch));
+  const dispDate = sanitizeWinAnsi(String(data.date));
+  const profileName = sanitizeWinAnsi(getShortProfileName(data.profile)).toUpperCase();
+
+  let y = H - margin - 10;
+  drawTracked(page, 'IDENTÉ', { y, size: 16, font: helveticaBold, tracking: 3, x: margin, color: black });
+  y -= 16;
+  page.drawText('PROBE 2 ML — PRODUKTIONSBLATT (INTERN)', { x: margin, y, size: 8, font: helveticaBold, color: black });
+  y -= 18;
+
+  const line = (label, value, bold) => {
+    page.drawText(label, { x: margin, y, size: 7.5, font: courier, color: black });
+    page.drawText(String(value), { x: margin + 90, y, size: 7.5, font: bold ? courierBold : courier, color: black });
+    y -= 11;
+  };
+  line('Kunde', dispName, true);
+  line('Profil', profileName, true);
+  line('Batch', dispBatch, true);
+  line('Datum', dispDate);
+  line('Konzentration', `${data.concentration}% Parfumoel`);
+  line('Fuellmenge', '2 ml');
+  y -= 6;
+
+  // Formula as % of oil (mathematically derived from the 50ml reference)
+  const groups = [
+    { title: 'KOPF', notes: formula.top || [] },
+    { title: 'HERZ', notes: formula.heart || [] },
+    { title: 'BASIS', notes: formula.base || [] }
+  ].filter(g => g.notes.length > 0);
+  const oilTotal = groups.reduce((s, g) => s + g.notes.reduce((a, n) => a + (Number(n.weight) || 0), 0), 0) || 1;
+
+  page.drawText('FORMEL (Anteile am Parfumoel · Referenzgewichte je 50 ml)', { x: margin, y, size: 7, font: helveticaBold, color: black });
+  y -= 12;
+  for (const g of groups) {
+    page.drawText(g.title, { x: margin, y, size: 7, font: courierBold, color: black });
+    y -= 10;
+    for (const n of g.notes) {
+      const w = Number(n.weight) || 0;
+      const pct = (100 * w / oilTotal).toFixed(1);
+      const name = sanitizeWinAnsi(n.name).slice(0, 26);
+      page.drawText(`${name.padEnd(28, '.')} ${pct.padStart(5)}%  ${w.toFixed(2).padStart(6)}g`, { x: margin + 6, y, size: 7, font: courier, color: black });
+      y -= 9.5;
+    }
+    y -= 3;
+  }
+  y -= 4;
+  page.drawText('HINWEIS: Probe aus Konzentrat-Ansatz abfuellen. Referenzgewichte', { x: margin, y, size: 6.5, font: helvetica, color: black });
+  y -= 9;
+  page.drawText('beziehen sich auf den 50-ml-Ansatz und sind NICHT 1:1 fuer 2 ml.', { x: margin, y, size: 6.5, font: helvetica, color: black });
+  y -= 9;
+  page.drawText('Sample-Etikett: Layout ausstehend (Flaeschchen-Masse offen).', { x: margin, y, size: 6.5, font: helveticaBold, color: black });
+
+  try {
+    const qrUrl = generateQRUrl(data);
+    const qrDataUrl = await QRCode.toDataURL(qrUrl, { width: 300, margin: 0, errorCorrectionLevel: 'M', color: { dark: '#000000ff', light: '#ffffffff' } });
+    const qrImage = await pdfDoc.embedPng(Buffer.from(qrDataUrl.replace(/^data:image\/png;base64,/, ''), 'base64'));
+    const qrSide = 42;
+    page.drawImage(qrImage, { x: W - margin - qrSide, y: H - margin - qrSide - 4, width: qrSide, height: qrSide });
+  } catch (e) {
+    console.log('QR failed');
+  }
+
+  return Buffer.from(await pdfDoc.save());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENCE (Netlify Blobs, best effort)
+// ═══════════════════════════════════════════════════════════════════════════
+// Two stores, both written after the email succeeded and both non-fatal:
+//   labels          order-<n>/<filename>  -> the exact PDF that was emailed
+//   batch-registry  batch-<batch>         -> formula snapshot for reorder/verify
+// onlyIfNew keeps the first snapshot authoritative on webhook retries.
+
+const LABELS_STORE = 'labels';
+const REGISTRY_STORE = 'batch-registry';
+
+async function persistArtifacts(event, order, labels, registryEntries) {
+  if (!netlifyBlobs) return;
+  let labelStore = null, registryStore = null;
+  try {
+    if (typeof netlifyBlobs.connectLambda === 'function' && event && event.blobs) {
+      netlifyBlobs.connectLambda(event);
+    }
+    labelStore = netlifyBlobs.getStore({ name: LABELS_STORE });
+    registryStore = netlifyBlobs.getStore({ name: REGISTRY_STORE });
+  } catch (e) {
+    console.log('Persistence stores unavailable, skipping archive:', e.message);
+    return;
+  }
+
+  for (const label of labels) {
+    try {
+      await labelStore.set(`order-${order.order_number}/${label.filename}`, label.content);
+    } catch (e) {
+      console.log(`Label archive failed for ${label.filename}:`, e.message);
+    }
+  }
+  for (const entry of registryEntries) {
+    try {
+      await registryStore.setJSON(`batch-${entry.batch}`, {
+        batch: entry.batch,
+        order: order.order_number,
+        type: entry.type,
+        qty: entry.qty,
+        profile: entry.data.profile,
+        name: entry.data.name,
+        date: entry.data.date,
+        concentration: entry.data.concentration,
+        formula: entry.formula,
+        createdAt: new Date().toISOString(),
+        source: 'generate-labels-v2'
+      }, { onlyIfNew: true });
+    } catch (e) {
+      console.log(`Registry write failed for batch ${entry.batch}:`, e.message);
+    }
+  }
+  console.log(`🗄️ Archived ${labels.length} PDFs + ${registryEntries.length} registry entries`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // EMAIL
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function sendEmail(order, labels) {
+function escapeHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function sendEmail(order, labels, productionNotes) {
   const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
   });
 
+  const notes = productionNotes || [];
   const isBundle = labels.length === 3;
-  const subject = isBundle 
-    ? `IDENTE Order #${order.order_number} - TRIO BUNDLE (3 Etiketten)`
-    : `IDENTE Order #${order.order_number} - ${labels.length} Etikett${labels.length > 1 ? 'en' : ''}`;
+  const isDuo = labels.length === 2;
+  const kind = isBundle ? 'TRIO BUNDLE (3 Etiketten)' : isDuo ? 'DUO (2 Etiketten)' : `${labels.length} Etikett${labels.length > 1 ? 'en' : ''}`;
+  const subject = `IDENTE Order #${order.order_number} - ${kind}`;
+
+  const fileList = labels
+    .map(l => `<li>${escapeHtml(l.filename)}${l.qty > 1 ? ` <strong>(× ${l.qty})</strong>` : ''}</li>`)
+    .join('');
+  const noteList = notes.length
+    ? `<p style="color: #9c6626; font-weight: bold;">${notes.map(escapeHtml).join('<br>')}</p>`
+    : '';
 
   await transporter.sendMail({
     from: process.env.EMAIL_USER,
     to: process.env.LABEL_EMAIL || process.env.EMAIL_USER,
     subject: subject,
     html: `
-      <h2>Neue ${isBundle ? 'TRIO BUNDLE ' : ''}Order!</h2>
-      <p><strong>Order:</strong> #${order.order_number}</p>
-      <p><strong>Kunde:</strong> ${order.customer?.first_name || ''} ${order.customer?.last_name || ''}</p>
+      <h2>Neue ${isBundle ? 'TRIO BUNDLE ' : isDuo ? 'DUO ' : ''}Order!</h2>
+      <p><strong>Order:</strong> #${escapeHtml(order.order_number)}</p>
+      <p><strong>Kunde:</strong> ${escapeHtml(order.customer?.first_name || '')} ${escapeHtml(order.customer?.last_name || '')}</p>
       <p><strong>Etiketten:</strong> ${labels.length}</p>
+      <ul>${fileList}</ul>
+      ${noteList}
       ${isBundle ? '<p style="color: #c5a059; font-weight: bold;">⚠️ TRIO BUNDLE - 3 separate Etiketten im Anhang!</p>' : ''}
       <hr>
       <p style="font-size: 12px; color: #666;">Generiert von IDENTÉ Label System</p>
     `,
-    attachments: labels
+    attachments: labels.map(l => ({ filename: l.filename, content: l.content }))
   });
 }
 
 // Exposed for local testing only - not used by the webhook path
-exports._test = { generatePersonalizedFormula, generateLabelPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook };
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml };
