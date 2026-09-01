@@ -39,11 +39,30 @@ const FORMULA_50 = {
   base: [{ name: 'Sandalwood', weight: 1.8 }, { name: 'Musk', weight: 1.5 }, { name: 'Ambroxan', weight: 1.65 }]
 };
 
+function formulaFor(concentration) {
+  const factor = concentration / 22;
+  return Object.fromEntries(Object.entries(FORMULA_50).map(([stage, notes]) => [
+    stage,
+    notes.map(note => ({ ...note, weight: note.weight * factor }))
+  ]));
+}
+
+const TYPE_VARIANTS = {
+  single: 52223237783893,
+  bundle: 52223237914965,
+  duo: 54803580125525,
+  probe: 54803580158293
+};
+
 function makeOrder(lineItems, orderNumber = 4711) {
   return {
     order_number: orderNumber,
     customer: { first_name: 'Test', last_name: 'Kunde <b>x</b>' },
-    line_items: lineItems
+    line_items: lineItems.map(item => {
+      const typeProperty = (item.properties || []).find(property => property.name === '_quiz_type');
+      const type = typeProperty ? typeProperty.value : 'single';
+      return { variant_id: TYPE_VARIANTS[type], ...item };
+    })
   };
 }
 function props(obj) {
@@ -64,6 +83,10 @@ async function main() {
   check('reducedScore NaN-safe', !T.reducedScore('abc', 2).includes('NaN'));
   check('fileSafeName strips bad chars', T.fileSafeName('A/b\\c:d*e') === 'A-b-c-d-e');
   check('fileSafeName empty fallback', T.fileSafeName('///') === 'Customer');
+  check('print label transliterates unsupported Latin letters', T.printableLabelName('Şule Łukasz') === 'Sule Lukasz');
+  let rejectedEmptyPrintName = false;
+  try { T.printableLabelName('Мария'); } catch { rejectedEmptyPrintName = true; }
+  check('print label rejects an empty unsupported rendering', rejectedEmptyPrintName);
   check('escapeHtml', T.escapeHtml('<b>&"\'') === '&lt;b&gt;&amp;&quot;&#39;');
   check('email kind is based on products, not attachment count',
     T.describeProductionKinds(['single', 'single'], 2) === '2 Etiketten');
@@ -75,17 +98,67 @@ async function main() {
   check('QR keeps Unicode exactly', unicodeQr.n === 'Şule Ünal-Özdemir 🌸', unicodeQr.n);
   check('QR carries profile/type/volume', unicodeQr.p === 'IDENTÉ Date' && unicodeQr.t === 'single' && unicodeQr.v === '50 ml');
 
-  // resolveFormula falls back on manipulated (negative) weights
+  // A supplied malformed formula is a production error, not a silent fallback.
   const bad = JSON.stringify({ top: [{ name: 'X', weight: -5 }], heart: [], base: [] });
-  const fb = T.resolveFormula(bad, { positive: ['fresh'], exclude: [] }, 22, 0);
-  check('resolveFormula rejects negative weights', fb.top.length >= 4);
+  let rejectedBadFormula = false;
+  try { T.resolveFormula(bad, { positive: ['fresh'], exclude: [] }, 22, 0); } catch { rejectedBadFormula = true; }
+  check('resolveFormula rejects negative/arbitrary materials', rejectedBadFormula);
   const good = T.resolveFormula(JSON.stringify(FORMULA_50), {}, 22, 0);
   check('resolveFormula accepts valid formula', good.top[0].name === 'Bergamot' && Math.abs(good.oilTotal - 11) < 1e-9);
+  let rejectedMismatch = false;
+  try { T.resolveFormula(JSON.stringify(FORMULA_50), {}, 28, 0); } catch { rejectedMismatch = true; }
+  check('resolveFormula rejects concentration/weight mismatch', rejectedMismatch);
+  check('usableFormula accepts localized theme material', !!T.usableFormula({
+    top: [{ name: 'Bergamotte', weight: 2 }],
+    heart: [{ name: 'Jasmin', weight: 4 }],
+    base: [{ name: 'Sandelholz', weight: 5 }]
+  }, 11));
+  let rejectedMissing = false;
+  try { T.resolveFormula('', {}, 22, 0); } catch (error) { rejectedMissing = error.message === 'Missing quiz formula'; }
+  check('resolveFormula rejects a missing production formula', rejectedMissing);
+  check('material aliases preserve semantics across locales',
+    T.canonicalMaterialName('Nelke') === 'Clove' &&
+    T.canonicalMaterialName('Carnation') === 'Clove' &&
+    T.canonicalMaterialName('Birke') === 'Birch Tar' &&
+    T.canonicalMaterialName('Guaiac Wood') === 'Guaiacwood' &&
+    T.canonicalMaterialName('Tee') === 'Tea');
+  const approvedDigest = T.formulaDigest(T.usableFormula(FORMULA_50, 11));
+  process.env.IDENTE_REQUIRE_FORMULA_APPROVAL = 'true';
+  delete process.env.IDENTE_APPROVED_FORMULA_HASHES;
+  let rejectedUnapproved = false;
+  try { T.resolveFormula(JSON.stringify(FORMULA_50), {}, 22, 0); } catch (error) { rejectedUnapproved = error.message.startsWith('Unapproved quiz formula'); }
+  check('production approval gate rejects an unapproved formula', rejectedUnapproved);
+  process.env.IDENTE_APPROVED_FORMULA_HASHES = approvedDigest;
+  check('production approval gate accepts an explicit server-side hash',
+    T.resolveFormula(JSON.stringify(FORMULA_50), {}, 22, 0).top[0].name === 'Bergamot');
+  delete process.env.IDENTE_REQUIRE_FORMULA_APPROVAL;
+  delete process.env.IDENTE_APPROVED_FORMULA_HASHES;
+
+  const registryRecord = {
+    batch: '12345678', order: 4711, orderId: 99, type: 'single', qty: 1,
+    profile: 'IDENTÉ Alltag', volume: '50 ml', name: 'Ada', date: '1.9.2026',
+    concentration: 22, formulaHash: approvedDigest, formulaVersion: 'quiz-v6-backend-v2',
+    materialLibraryVersion: 'legacy-60-2026-09'
+  };
+  check('registry replay requires all production metadata',
+    T.registryRecordMatches({ ...registryRecord }, registryRecord) &&
+    !T.registryRecordMatches({ ...registryRecord, profile: 'IDENTÉ Date' }, registryRecord));
+  let registryCollision = false;
+  try {
+    await T.writeRegistryEntry({
+      setJSON: async () => ({ modified: false }),
+      get: async () => ({ ...registryRecord, name: 'Mallory' })
+    }, 'batch-12345678', registryRecord);
+  } catch (error) { registryCollision = error.message === 'Batch collision 12345678'; }
+  check('registry fake store rejects same-order metadata collision', registryCollision);
 
   // ── HMAC ──────────────────────────────────────────────────────────────────
   console.log('hmac:');
   delete process.env.SHOPIFY_WEBHOOK_SECRET;
-  check('unenforced without secret', T.verifyShopifyHmac({ headers: {}, body: 'x' }).ok === true);
+  check('missing secret fails closed', T.verifyShopifyHmac({ headers: {}, body: 'x' }).reason === 'missing_secret');
+  sentEmails.length = 0;
+  const unconfigured = await fn.handler({ body: '{}', headers: {} }, {});
+  check('handler refuses work without secret', unconfigured.statusCode === 503 && sentEmails.length === 0);
   process.env.SHOPIFY_WEBHOOK_SECRET = 'shhh';
   const body = JSON.stringify({ a: 1 });
   const sig = crypto.createHmac('sha256', 'shhh').update(body, 'utf8').digest('base64');
@@ -133,7 +206,7 @@ async function main() {
     properties: props({
       _quiz_batch: '96991840', _quiz_name: 'Şule Ünal-Özdemir 🌸', _quiz_date: '26.8.2026',
       _quiz_profile: 'IDENTÉ Date', _quiz_concentration: '28', _quiz_harmonie: '91', _quiz_match: '95',
-      _quiz_formula: JSON.stringify(FORMULA_50),
+      _quiz_formula: JSON.stringify(formulaFor(28)),
       _quiz_tags: JSON.stringify({ positive: ['sensual'], exclude: [] })
     })
   }])));
@@ -153,9 +226,9 @@ async function main() {
     properties: props({
       _quiz_type: 'bundle', _quiz_batch: '43684962', _quiz_name: 'Lena', _quiz_date: '19.1.2026',
       _quiz_concentration: '25', _quiz_harmonie: '93', _quiz_match: '94',
-      _quiz_main_profile: 'IDENTÉ Alltag', _quiz_main_formula: JSON.stringify(FORMULA_50),
-      _quiz_rec1_profile: 'IDENTÉ Date', _quiz_rec1_formula: JSON.stringify(FORMULA_50),
-      _quiz_rec2_profile: 'IDENTÉ Business', _quiz_rec2_formula: JSON.stringify(FORMULA_50),
+      _quiz_main_profile: 'IDENTÉ Alltag', _quiz_main_formula: JSON.stringify(formulaFor(25)),
+      _quiz_rec1_profile: 'IDENTÉ Date', _quiz_rec1_formula: JSON.stringify(formulaFor(25)),
+      _quiz_rec2_profile: 'IDENTÉ Business', _quiz_rec2_formula: JSON.stringify(formulaFor(25)),
       _quiz_tags: JSON.stringify({ positive: ['elegant'], exclude: [] })
     })
   }])));
@@ -174,6 +247,9 @@ async function main() {
     properties: props({
       _quiz_type: 'bundle', _quiz_batch: 'X99Z', _quiz_name: 'Nan Test',
       _quiz_harmonie: 'zz', _quiz_match: 'zz',
+      _quiz_main_formula: JSON.stringify(FORMULA_50),
+      _quiz_rec1_formula: JSON.stringify(FORMULA_50),
+      _quiz_rec2_formula: JSON.stringify(FORMULA_50),
       _quiz_tags: JSON.stringify({ positive: ['fresh'], exclude: [] })
     })
   }])));
@@ -227,6 +303,7 @@ async function main() {
     name: 'Dein Persönlicher Duft - Alltag', quantity: 2,
     properties: props({
       _quiz_batch: '88880001', _quiz_name: 'Kim', _quiz_profile: 'IDENTÉ Alltag',
+      _quiz_formula: JSON.stringify(FORMULA_50),
       _quiz_tags: JSON.stringify({ positive: ['fresh'], exclude: [] })
     })
   }])));
@@ -246,6 +323,9 @@ async function main() {
       name: 'Trio Bundle', quantity: 1,
       properties: props({
         _quiz_type: 'bundle', _quiz_batch: '10000001', _quiz_name: 'Alex',
+        _quiz_main_formula: JSON.stringify(FORMULA_50),
+        _quiz_rec1_formula: JSON.stringify(FORMULA_50),
+        _quiz_rec2_formula: JSON.stringify(FORMULA_50),
         _quiz_tags: JSON.stringify({ positive: ['woody'], exclude: [] })
       })
     },
@@ -253,6 +333,7 @@ async function main() {
       name: 'Dein Persönlicher Duft - Business', quantity: 1,
       properties: props({
         _quiz_batch: '10000009', _quiz_name: 'Alex', _quiz_profile: 'IDENTÉ Business',
+        _quiz_formula: JSON.stringify(FORMULA_50),
         _quiz_tags: JSON.stringify({ positive: ['woody'], exclude: [] })
       })
     }
@@ -260,6 +341,43 @@ async function main() {
   check('mixed: 200', res.statusCode === 200, res.body);
   check('mixed: 4 attachments', sentEmails[0].attachments.length === 4, String(sentEmails[0].attachments.length));
   check('mixed: subject is not mislabeled as bundle', sentEmails[0].subject.includes('MIXED ORDER'), sentEmails[0].subject);
+
+  // ── adversarial production-contract checks ───────────────────────────────
+  console.log('contract hardening:');
+  sentEmails.length = 0;
+  res = await T.processWebhook(event(makeOrder([{
+    variant_id: TYPE_VARIANTS.probe,
+    name: 'Manipulated sample', quantity: 1,
+    properties: props({
+      _quiz_batch: '22220001', _quiz_name: 'Mallory', _quiz_profile: 'IDENTÉ Alltag',
+      _quiz_concentration: '22', _quiz_formula: JSON.stringify(FORMULA_50)
+    })
+  }], 4801)));
+  check('variant/type mismatch is rejected before email', res.statusCode === 500 && sentEmails.length === 0, res.body);
+
+  sentEmails.length = 0;
+  res = await T.processWebhook(event(makeOrder([{
+    name: 'Single A', quantity: 1,
+    properties: props({
+      _quiz_batch: '33330001', _quiz_name: 'Ada', _quiz_profile: 'IDENTÉ Alltag',
+      _quiz_concentration: '22', _quiz_formula: JSON.stringify(FORMULA_50)
+    })
+  }, {
+    name: 'Single B', quantity: 1,
+    properties: props({
+      _quiz_batch: '33330001', _quiz_name: 'Ada', _quiz_profile: 'IDENTÉ Date',
+      _quiz_concentration: '22', _quiz_formula: JSON.stringify(FORMULA_50)
+    })
+  }], 4802)));
+  check('duplicate batch inside one order is rejected before email', res.statusCode === 500 && sentEmails.length === 0, res.body);
+
+  sentEmails.length = 0;
+  res = await T.processWebhook(event(makeOrder([{
+    variant_id: 999999999,
+    name: 'Unknown quiz product', quantity: 1,
+    properties: props({ _quiz_batch: '44440001', _quiz_name: 'Eve' })
+  }], 4803)));
+  check('unknown quiz variant is rejected before email', res.statusCode === 500 && sentEmails.length === 0, res.body);
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

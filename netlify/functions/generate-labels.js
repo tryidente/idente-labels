@@ -85,6 +85,93 @@ const NOTES_DATABASE = {
   ]
 };
 
+// Shopify variant IDs are the server-side authority for the physical product.
+// Line-item properties are customer-controlled and may describe the quiz, but
+// they must never be able to turn a 2 ml sample into a 50 ml bottle (or vice
+// versa). Keep this map in sync with the store before adding a new offer.
+const VARIANT_TYPE = new Map([
+  ['52223237783893', 'single'], // Alltag
+  ['52223237816661', 'single'], // Date
+  ['52223237849429', 'single'], // Business
+  ['52223237882197', 'single'], // Freizeit
+  ['52223237914965', 'bundle'], // Trio
+  ['54803580125525', 'duo'],
+  ['54803580158293', 'probe']
+]);
+
+const ALLOWED_CONCENTRATIONS = new Set([18, 20, 22, 25, 28]);
+
+// The storefront may serialize DE or EN display names. Production records use
+// one canonical legacy material name so locale cannot change the substance.
+const CANONICAL_MATERIALS = new Set(
+  Object.values(NOTES_DATABASE).flat().map(note => note.name)
+);
+const MATERIAL_ALIASES = new Map(Object.entries({
+  Bergamotte: 'Bergamot', Zitrone: 'Lemon', Orange: 'Sweet Orange', Mandarine: 'Mandarin',
+  Minze: 'Mint', 'Grüner Apfel': 'Green Apple', Blackcurrant: 'Cassis',
+  'Rosa Pfeffer': 'Pink Pepper', Kardamom: 'Cardamom', Basilikum: 'Basil',
+  Meerwasser: 'Sea Water', Ingwer: 'Ginger', Jasmin: 'Jasmine',
+  Maiglöckchen: 'Lily of the Valley', Freesie: 'Freesia', Pfingstrose: 'Peony',
+  Lavendel: 'Lavender', Geranie: 'Geranium', Orangenblüte: 'Orange Blossom',
+  Nelke: 'Clove', Carnation: 'Clove', Zimt: 'Cinnamon', Muskatnuss: 'Nutmeg',
+  Safran: 'Saffron', Tonkabohne: 'Tonka Bean', Pfirsich: 'Peach', Pflaume: 'Plum',
+  'Rote Beeren': 'Red Berries', Schokolade: 'Chocolate', Kaffee: 'Coffee',
+  Tabak: 'Tobacco', Tee: 'Tea', Sandelholz: 'Sandalwood', Zedernholz: 'Cedarwood',
+  Guajakholz: 'Guaiacwood', 'Guaiac Wood': 'Guaiacwood', Eichenmoos: 'Oakmoss',
+  Moschus: 'Musk', Vanille: 'Vanilla', Benzoe: 'Benzoin', Weihrauch: 'Frankincense',
+  Leder: 'Leather', Birke: 'Birch Tar', Birch: 'Birch Tar', Wildleder: 'Suede'
+}));
+
+function canonicalMaterialName(name) {
+  const trimmed = typeof name === 'string' ? name.trim() : '';
+  const canonical = MATERIAL_ALIASES.get(trimmed) || trimmed;
+  return CANONICAL_MATERIALS.has(canonical) ? canonical : null;
+}
+
+function formulaApprovalRequired() {
+  return process.env.CONTEXT === 'production' || process.env.IDENTE_REQUIRE_FORMULA_APPROVAL === 'true';
+}
+
+function approvedFormulaHashes() {
+  return new Set(String(process.env.IDENTE_APPROVED_FORMULA_HASHES || '')
+    .split(/[\s,]+/)
+    .map(value => value.trim().toLowerCase())
+    .filter(value => /^[a-f0-9]{64}$/.test(value)));
+}
+
+function assertFormulaApproved(formula) {
+  if (!formulaApprovalRequired()) return;
+  const digest = formulaDigest(formula);
+  if (!approvedFormulaHashes().has(digest)) {
+    throw new Error(`Unapproved quiz formula ${digest}`);
+  }
+}
+
+function resolveVariantType(item, props) {
+  const variantId = String(item && (item.variant_id || item.variantId) || '');
+  const expected = VARIANT_TYPE.get(variantId);
+  if (!expected) throw new Error(`Unsupported quiz variant ${variantId || '(missing)'}`);
+  const claimed = props._quiz_type || 'single';
+  if (claimed !== expected) {
+    throw new Error(`Quiz product/type mismatch for variant ${variantId}: expected ${expected}, got ${claimed}`);
+  }
+  return expected;
+}
+
+function parseConcentration(value) {
+  const concentration = Number(value == null || value === '' ? 22 : value);
+  if (!Number.isInteger(concentration) || !ALLOWED_CONCENTRATIONS.has(concentration)) {
+    throw new Error(`Unsupported quiz concentration ${String(value)}`);
+  }
+  return concentration;
+}
+
+function validateBatch(value) {
+  const batch = String(value || '').trim();
+  if (!/^[A-Za-z0-9-]{4,24}$/.test(batch)) throw new Error('Missing or invalid quiz batch');
+  return batch;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PERSONALIZED FORMULA ALGORITHM
 // ═══════════════════════════════════════════════════════════════════════════
@@ -194,19 +281,21 @@ function fileSafeName(name) {
 }
 
 function resolveFormula(rawFormulaJson, quizTags, concentration, seed) {
-  if (rawFormulaJson) {
-    try {
-      const usable = usableFormula(JSON.parse(rawFormulaJson));
-      if (usable) {
-        const totalOil = 50 * (concentration / 100);
-        return {
-          top: usable.top, heart: usable.heart, base: usable.base,
-          oilTotal: totalOil, alcoholTotal: 50 - totalOil, grandTotal: 50
-        };
-      }
-    } catch (e) { /* fall through to generator */ }
+  if (!rawFormulaJson) throw new Error('Missing quiz formula');
+  let parsed;
+  try {
+    parsed = JSON.parse(rawFormulaJson);
+  } catch {
+    throw new Error('Invalid quiz formula JSON');
   }
-  return generatePersonalizedFormula(quizTags, concentration, seed);
+  const usable = usableFormula(parsed, 50 * (concentration / 100));
+  if (!usable) throw new Error('Invalid quiz formula');
+  assertFormulaApproved(usable);
+  const totalOil = 50 * (concentration / 100);
+  return {
+    top: usable.top, heart: usable.heart, base: usable.base,
+    oilTotal: totalOil, alcoholTotal: 50 - totalOil, grandTotal: 50
+  };
 }
 
 const processWebhook = async (event, context) => {
@@ -219,6 +308,7 @@ const processWebhook = async (event, context) => {
     const registryEntries = [];
     const productionNotes = [];
     const productionKinds = [];
+    const orderBatches = new Set();
 
     for (const item of order.line_items) {
       console.log(`📝 Processing item: ${item.name}`);
@@ -231,13 +321,18 @@ const processWebhook = async (event, context) => {
       const props = {};
       item.properties.forEach(p => { props[p.name] = p.value; });
 
+      if (!Object.keys(props).some(key => key.startsWith('_quiz_'))) {
+        console.log('⚠️ No quiz properties found, skipping');
+        continue;
+      }
+
       const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
-      const type = props._quiz_type || 'single';
+      const type = resolveVariantType(item, props);
       productionKinds.push(type);
-      const baseBatch = props._quiz_batch || String(Date.now()).slice(-8);
+      const baseBatch = validateBatch(props._quiz_batch);
       const customerName = props._quiz_name || order.customer?.first_name || 'Customer';
       const dateStr = props._quiz_date || new Date().toLocaleDateString('de-DE');
-      const concentration = parseInt(props._quiz_concentration) || 22;
+      const concentration = parseConcentration(props._quiz_concentration);
       const harmonie = toScoreString(props._quiz_harmonie, '95');
       const match = toScoreString(props._quiz_match, '92');
 
@@ -280,6 +375,8 @@ const processWebhook = async (event, context) => {
             harmonie: pi === 0 ? harmonie : reducedScore(harmonie, part.dH),
             match: pi === 0 ? match : reducedScore(match, part.dM)
           };
+          if (orderBatches.has(data.batch)) throw new Error(`Duplicate batch ${data.batch} in order`);
+          orderBatches.add(data.batch);
           const pdf = await generateLabelPDF(data, formula);
           labels.push({
             filename: `IDENTE-${fileSafeName(customerName)}-${data.batch}-${part.suffix}.pdf`,
@@ -308,6 +405,8 @@ const processWebhook = async (event, context) => {
           harmonie,
           match
         };
+        if (orderBatches.has(data.batch)) throw new Error(`Duplicate batch ${data.batch} in order`);
+        orderBatches.add(data.batch);
         const formula = resolveFormula(props._quiz_formula, quizTags, concentration, 0);
         const pdf = await generateSampleSheetPDF(data, formula);
         labels.push({
@@ -335,6 +434,8 @@ const processWebhook = async (event, context) => {
           harmonie,
           match
         };
+        if (orderBatches.has(quizData.batch)) throw new Error(`Duplicate batch ${quizData.batch} in order`);
+        orderBatches.add(quizData.batch);
         const formula = resolveFormula(props._quiz_formula, quizTags, concentration, 0);
         const pdf = await generateLabelPDF(quizData, formula);
         labels.push({
@@ -348,10 +449,12 @@ const processWebhook = async (event, context) => {
     }
 
     if (labels.length > 0) {
+      // Reserve batches and archive exact artifacts before the irreversible
+      // production-email side effect. Cross-order batch collisions now fail the
+      // webhook instead of silently keeping an unrelated historical snapshot.
+      await persistArtifacts(event, order, labels, registryEntries);
       console.log(`📧 Sending ${labels.length} labels via email`);
       await sendEmail(order, labels, productionNotes, productionKinds);
-      // Best effort, never fails the webhook: archive PDFs + formula snapshots
-      await persistArtifacts(event, order, labels, registryEntries);
       console.log('✅ Success!');
     } else {
       console.log('⚠️ No labels generated');
@@ -389,24 +492,24 @@ function getRawBody(event) {
   return event.isBase64Encoded ? Buffer.from(event.body, 'base64') : Buffer.from(event.body, 'utf8');
 }
 
-// Shopify webhook HMAC verification. Enforced only when SHOPIFY_WEBHOOK_SECRET
-// is set, so the function keeps working until the secret is configured in both
-// Shopify and Netlify; once set, forged requests are rejected before any
-// side effect (email, blobs, PDF work).
+// Shopify webhook HMAC verification is fail-closed. An unsigned compatibility
+// mode would make the public function an email/PDF-production endpoint and is
+// therefore deliberately not available in deployed code.
 function verifyShopifyHmac(event) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
-  if (!secret) return { ok: true, enforced: false };
+  if (!secret) return { ok: false, enforced: true, reason: 'missing_secret' };
   const headers = event.headers || {};
   const given = headers['x-shopify-hmac-sha256'] || headers['X-Shopify-Hmac-Sha256'];
-  if (!given) return { ok: false, enforced: true };
+  if (!given) return { ok: false, enforced: true, reason: 'missing_signature' };
   const digest = crypto.createHmac('sha256', secret).update(getRawBody(event)).digest('base64');
   const a = Buffer.from(digest);
   const b = Buffer.from(String(given));
-  if (a.length !== b.length) return { ok: false, enforced: true };
+  if (a.length !== b.length) return { ok: false, enforced: true, reason: 'invalid_signature' };
   try {
-    return { ok: crypto.timingSafeEqual(a, b), enforced: true };
+    const ok = crypto.timingSafeEqual(a, b);
+    return { ok, enforced: true, reason: ok ? undefined : 'invalid_signature' };
   } catch (e) {
-    return { ok: false, enforced: true };
+    return { ok: false, enforced: true, reason: 'invalid_signature' };
   }
 }
 
@@ -459,22 +562,29 @@ async function acquireLease(store, key) {
 exports.handler = async (event, context) => {
   const hmac = verifyShopifyHmac(event);
   if (!hmac.ok) {
+    if (hmac.reason === 'missing_secret') {
+      return { statusCode: 503, body: JSON.stringify({ error: 'Webhook verification is not configured' }) };
+    }
     console.log('🚫 Webhook HMAC verification failed - rejecting');
     return { statusCode: 401, body: JSON.stringify({ error: 'Invalid webhook signature' }) };
   }
-  if (!hmac.enforced) {
-    console.log('⚠️ SHOPIFY_WEBHOOK_SECRET not set - HMAC verification skipped');
-  }
-
   const store = getIdempotencyStore(event);
-  if (!store) return processWebhook(event, context);
+  if (!store) {
+    if (productionPersistenceRequired()) {
+      return { statusCode: 503, body: JSON.stringify({ error: 'Idempotency storage unavailable' }) };
+    }
+    return processWebhook(event, context);
+  }
 
   const key = idempotencyKey(event);
   let state;
   try {
     state = await acquireLease(store, key);
   } catch (e) {
-    console.log('Idempotency check failed, processing without dedupe:', e.message);
+    if (productionPersistenceRequired()) {
+      return { statusCode: 503, body: JSON.stringify({ error: 'Idempotency storage unavailable' }) };
+    }
+    console.log('Idempotency check failed, processing without dedupe in local context:', e.message);
     return processWebhook(event, context);
   }
 
@@ -523,6 +633,10 @@ function generateQRUrl(data) {
   return 'https://tryidente.com/pages/verify?d=' + encodeURIComponent(b64);
 }
 
+function productionPersistenceRequired() {
+  return process.env.CONTEXT === 'production' || process.env.IDENTE_REQUIRE_PERSISTENCE === 'true';
+}
+
 function getShortProfileName(profile) {
   if (!profile) return '';
   return profile.replace(/^IDENT[EÉ]\s*/i, '');
@@ -538,6 +652,10 @@ const WINANSI_EXTRA = String.fromCharCode(
 );
 function sanitizeWinAnsi(str) {
   if (!str) return '';
+  const latinFallback = {
+    'Ł': 'L', 'ł': 'l', 'Đ': 'D', 'đ': 'd', 'Ð': 'D', 'ð': 'd',
+    'Þ': 'Th', 'þ': 'th', 'Æ': 'AE', 'æ': 'ae', 'Ø': 'O', 'ø': 'o'
+  };
   const ok = c => {
     const p = c.codePointAt(0);
     return (p >= 0x20 && p <= 0x7E) || (p >= 0xA0 && p <= 0xFF) || WINANSI_EXTRA.includes(c);
@@ -545,6 +663,7 @@ function sanitizeWinAnsi(str) {
   let out = '';
   for (const c of String(str).normalize('NFC')) {
     if (ok(c)) { out += c; continue; }
+    if (latinFallback[c]) { out += latinFallback[c]; continue; }
     for (const d of c.normalize('NFKD')) {
       if (ok(d)) { out += d; break; }
     }
@@ -552,26 +671,37 @@ function sanitizeWinAnsi(str) {
   return out.replace(/\s+/g, ' ').trim();
 }
 
+function printableLabelName(name) {
+  const printable = sanitizeWinAnsi(name);
+  if (!printable) throw new Error('Customer name cannot be rendered on the production label');
+  return printable;
+}
+
 // Validates a theme-provided formula before it reaches the label: three note
-// arrays, every weight a finite positive number, 3-20 notes total (more than
-// 20 cannot fit the 70mm panel). Returns a normalized copy, or null so the
-// caller falls back to generatePersonalizedFormula instead of printing garbage.
-function usableFormula(f) {
+// arrays, an allow-listed material name, every weight a finite positive number,
+// 3-20 notes total and (when supplied) an oil total matching the declared
+// concentration. Returns a normalized copy or null; callers reject an invalid
+// supplied formula instead of silently changing the customer's production data.
+function usableFormula(f, expectedOilTotal) {
   if (!f || typeof f !== 'object') return null;
   const norm = {};
   let count = 0;
+  let weightTotal = 0;
   for (const key of ['top', 'heart', 'base']) {
     const notes = Array.isArray(f[key]) ? f[key] : [];
     const out = [];
     for (const n of notes) {
       const w = Number(n && n.weight);
-      if (!n || typeof n.name !== 'string' || !n.name.trim() || !isFinite(w) || w <= 0) return null;
-      out.push({ name: n.name, weight: w });
+      const name = canonicalMaterialName(n && n.name);
+      if (!name || !isFinite(w) || w <= 0) return null;
+      out.push({ name, weight: w });
+      weightTotal += w;
       count++;
     }
     norm[key] = out;
   }
   if (count < 3 || count > 20) return null;
+  if (Number.isFinite(expectedOilTotal) && Math.abs(weightTotal - expectedOilTotal) > 0.03) return null;
   return norm;
 }
 
@@ -636,7 +766,7 @@ async function generateLabelPDF(data, formula) {
   const ellipsis = String.fromCharCode(0x2026);
   // Display copies are WinAnsi-sanitized so drawing can never throw; the QR
   // keeps the raw values so the verify page shows the name exactly as entered.
-  const dispName = sanitizeWinAnsi(data.name);
+  const dispName = printableLabelName(data.name);
   const dispBatch = sanitizeWinAnsi(String(data.batch));
   const dispDate = sanitizeWinAnsi(String(data.date));
   const profileName = sanitizeWinAnsi(getShortProfileName(data.profile)).toUpperCase();
@@ -824,7 +954,7 @@ async function generateSampleSheetPDF(data, formula) {
   const margin = 8 * MM;
   const page = pdfDoc.addPage([W, H]);
 
-  const dispName = sanitizeWinAnsi(data.name);
+  const dispName = printableLabelName(data.name);
   const dispBatch = sanitizeWinAnsi(String(data.batch));
   const dispDate = sanitizeWinAnsi(String(data.date));
   const profileName = sanitizeWinAnsi(getShortProfileName(data.profile)).toUpperCase();
@@ -891,18 +1021,47 @@ async function generateSampleSheetPDF(data, formula) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PERSISTENCE (Netlify Blobs, best effort)
+// PERSISTENCE (Netlify Blobs)
 // ═══════════════════════════════════════════════════════════════════════════
-// Two stores, both written after the email succeeded and both non-fatal:
+// Two stores, both written before the production email:
 //   labels          order-<n>/<filename>  -> the exact PDF that was emailed
 //   batch-registry  batch-<batch>         -> formula snapshot for reorder/verify
-// onlyIfNew keeps the first snapshot authoritative on webhook retries.
+// onlyIfNew keeps the first snapshot authoritative. Production fails closed on
+// unavailable storage or a cross-order batch collision; local tests may run
+// without Netlify credentials.
 
 const LABELS_STORE = 'labels';
 const REGISTRY_STORE = 'batch-registry';
 
+function formulaDigest(formula) {
+  return crypto.createHash('sha256').update(JSON.stringify(formula)).digest('hex');
+}
+
+function registryRecordMatches(existing, record) {
+  if (!existing) return false;
+  const fields = [
+    'batch', 'order', 'orderId', 'type', 'qty', 'profile', 'volume', 'name',
+    'date', 'concentration', 'formulaHash', 'formulaVersion', 'materialLibraryVersion'
+  ];
+  return fields.every(field => String(existing[field] ?? '') === String(record[field] ?? ''));
+}
+
+async function writeRegistryEntry(registryStore, key, record) {
+  const write = await registryStore.setJSON(key, record, { onlyIfNew: true });
+  if (write && write.modified === false) {
+    const existing = await registryStore.get(key, { type: 'json' });
+    if (!registryRecordMatches(existing, record)) {
+      throw new Error(`Batch collision ${record.batch}`);
+    }
+  }
+}
+
 async function persistArtifacts(event, order, labels, registryEntries) {
-  if (!netlifyBlobs) return;
+  const required = productionPersistenceRequired();
+  if (!netlifyBlobs) {
+    if (required) throw new Error('Persistence library unavailable');
+    return;
+  }
   let labelStore = null, registryStore = null;
   try {
     if (typeof netlifyBlobs.connectLambda === 'function' && event && event.blobs) {
@@ -911,35 +1070,46 @@ async function persistArtifacts(event, order, labels, registryEntries) {
     labelStore = netlifyBlobs.getStore({ name: LABELS_STORE });
     registryStore = netlifyBlobs.getStore({ name: REGISTRY_STORE });
   } catch (e) {
-    console.log('Persistence stores unavailable, skipping archive:', e.message);
+    if (required) throw new Error(`Persistence stores unavailable: ${e.message}`);
+    console.log('Persistence stores unavailable in local context, skipping archive:', e.message);
     return;
+  }
+
+  for (const entry of registryEntries) {
+    const key = `batch-${entry.batch}`;
+    const formulaHash = formulaDigest(entry.formula);
+    const record = {
+      batch: entry.batch,
+      order: order.order_number,
+      orderId: order.id || null,
+      type: entry.type,
+      qty: entry.qty,
+      profile: entry.data.profile,
+      volume: entry.data.volume,
+      name: entry.data.name,
+      date: entry.data.date,
+      concentration: entry.data.concentration,
+      formula: entry.formula,
+      formulaHash,
+      formulaVersion: 'quiz-v6-backend-v2',
+      materialLibraryVersion: 'legacy-60-2026-09',
+      createdAt: new Date().toISOString(),
+      source: 'generate-labels-v2'
+    };
+    try {
+      await writeRegistryEntry(registryStore, key, record);
+    } catch (e) {
+      if (String(e.message).startsWith('Batch collision') || required) throw e;
+      console.log(`Registry unavailable for batch ${entry.batch} in local context:`, e.message);
+    }
   }
 
   for (const label of labels) {
     try {
-      await labelStore.set(`order-${order.order_number}/${label.filename}`, label.content);
+      await labelStore.set(`order-${order.order_number}/${label.filename}`, label.content, { onlyIfNew: true });
     } catch (e) {
-      console.log(`Label archive failed for ${label.filename}:`, e.message);
-    }
-  }
-  for (const entry of registryEntries) {
-    try {
-      await registryStore.setJSON(`batch-${entry.batch}`, {
-        batch: entry.batch,
-        order: order.order_number,
-        type: entry.type,
-        qty: entry.qty,
-        profile: entry.data.profile,
-        volume: entry.data.volume,
-        name: entry.data.name,
-        date: entry.data.date,
-        concentration: entry.data.concentration,
-        formula: entry.formula,
-        createdAt: new Date().toISOString(),
-        source: 'generate-labels-v2'
-      }, { onlyIfNew: true });
-    } catch (e) {
-      console.log(`Registry write failed for batch ${entry.batch}:`, e.message);
+      if (required) throw e;
+      console.log(`Label archive unavailable for ${label.filename} in local context:`, e.message);
     }
   }
   console.log(`🗄️ Archived ${labels.length} PDFs + ${registryEntries.length} registry entries`);
@@ -1005,4 +1175,4 @@ async function sendEmail(order, labels, productionNotes, productionKinds) {
 }
 
 // Exposed for local testing only - not used by the webhook path
-exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds };
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, printableLabelName, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds, resolveVariantType, parseConcentration, validateBatch, formulaDigest, productionPersistenceRequired, canonicalMaterialName, formulaApprovalRequired, approvedFormulaHashes, assertFormulaApproved, registryRecordMatches, writeRegistryEntry };
