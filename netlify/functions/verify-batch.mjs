@@ -106,7 +106,12 @@ export async function handleVerify(request, dependencies = {}) {
 
   try {
     const getStoreFn = dependencies.getStore || getStore;
-    const store = getStoreFn({ name: registryStoreName(request) });
+    // Verification is the customer-facing authoritative lookup. Use an origin
+    // read so cached updates or repairs cannot surface a false `not_registered`.
+    const store = getStoreFn({
+      name: registryStoreName(request),
+      consistency: 'strong'
+    });
     const record = await store.get(`batch-${batch}`, { type: 'json' });
     if (!record) {
       return json(404, { confirmed: false, reason: 'not_registered' }, origin);

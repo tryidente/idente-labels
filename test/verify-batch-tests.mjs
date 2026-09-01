@@ -27,9 +27,13 @@ const record = {
   createdAt: '2026-09-01T12:00:00.000Z'
 };
 
+let requestedStoreOptions = null;
 function deps(value = record) {
   return {
-    getStore: () => ({ get: async () => value })
+    getStore: (options) => {
+      requestedStoreOptions = options;
+      return { get: async () => value };
+    }
   };
 }
 
@@ -42,6 +46,8 @@ const ok = await handleVerify(
 const okBody = await ok.json();
 check('registered batch returns 200', ok.status === 200);
 check('registered batch is confirmed', okBody.confirmed === true);
+check('verification uses strong-consistency registry reads',
+  requestedStoreOptions?.consistency === 'strong' && requestedStoreOptions?.name === 'batch-registry');
 check('public response carries product metadata', okBody.type === 'probe' && okBody.volume === '2 ml');
 check('public response omits customer, order and formula',
   !('name' in okBody) && !('order' in okBody) && !('formula' in okBody));
