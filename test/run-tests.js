@@ -155,6 +155,7 @@ async function main() {
   // ── HMAC ──────────────────────────────────────────────────────────────────
   console.log('hmac:');
   delete process.env.SHOPIFY_WEBHOOK_SECRET;
+  delete process.env.SHOPIFY_WEBHOOK_SECRET_PREVIOUS;
   check('missing secret fails closed', T.verifyShopifyHmac({ headers: {}, body: 'x' }).reason === 'missing_secret');
   sentEmails.length = 0;
   const unconfigured = await fn.handler({ body: '{}', headers: {} }, {});
@@ -163,6 +164,10 @@ async function main() {
   const body = JSON.stringify({ a: 1 });
   const sig = crypto.createHmac('sha256', 'shhh').update(body, 'utf8').digest('base64');
   check('valid signature accepted', T.verifyShopifyHmac({ headers: { 'x-shopify-hmac-sha256': sig }, body }).ok === true);
+  process.env.SHOPIFY_WEBHOOK_SECRET_PREVIOUS = 'old-shhh';
+  const previousSig = crypto.createHmac('sha256', 'old-shhh').update(body, 'utf8').digest('base64');
+  check('previous rotation signature accepted during overlap', T.verifyShopifyHmac({ headers: { 'x-shopify-hmac-sha256': previousSig }, body }).ok === true);
+  check('primary signature remains accepted during overlap', T.verifyShopifyHmac({ headers: { 'x-shopify-hmac-sha256': sig }, body }).ok === true);
   check('invalid signature rejected', T.verifyShopifyHmac({ headers: { 'x-shopify-hmac-sha256': 'AAAA' + sig.slice(4) }, body }).ok === false);
   check('missing header rejected', T.verifyShopifyHmac({ headers: {}, body }).ok === false);
   const b64 = { headers: { 'x-shopify-hmac-sha256': sig }, body: Buffer.from(body, 'utf8').toString('base64'), isBase64Encoded: true };
@@ -174,6 +179,8 @@ async function main() {
   }, {});
   check('handler rejects invalid HMAC before side effects', rejected.statusCode === 401 && sentEmails.length === 0);
   delete process.env.SHOPIFY_WEBHOOK_SECRET;
+  check('previous-only configuration fails closed', T.verifyShopifyHmac({ headers: { 'x-shopify-hmac-sha256': previousSig }, body }).reason === 'missing_secret');
+  delete process.env.SHOPIFY_WEBHOOK_SECRET_PREVIOUS;
 
   // ── idempotency lease state machine ─────────────────────────────────────
   console.log('idempotency:');

@@ -496,21 +496,31 @@ function getRawBody(event) {
 // mode would make the public function an email/PDF-production endpoint and is
 // therefore deliberately not available in deployed code.
 function verifyShopifyHmac(event) {
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
-  if (!secret) return { ok: false, enforced: true, reason: 'missing_secret' };
+  const primary = String(process.env.SHOPIFY_WEBHOOK_SECRET || '').trim();
+  if (!primary) return { ok: false, enforced: true, reason: 'missing_secret' };
+  // During a controlled rotation Shopify may still sign with the old secret.
+  // Keep this overlap explicit and temporary; remove PREVIOUS after the new
+  // signing path has been observed and the old credential has been revoked.
+  const previous = String(process.env.SHOPIFY_WEBHOOK_SECRET_PREVIOUS || '').trim();
+  const secrets = [...new Set([primary, previous].filter(Boolean))];
   const headers = event.headers || {};
   const given = headers['x-shopify-hmac-sha256'] || headers['X-Shopify-Hmac-Sha256'];
   if (!given) return { ok: false, enforced: true, reason: 'missing_signature' };
-  const digest = crypto.createHmac('sha256', secret).update(getRawBody(event)).digest('base64');
-  const a = Buffer.from(digest);
   const b = Buffer.from(String(given));
-  if (a.length !== b.length) return { ok: false, enforced: true, reason: 'invalid_signature' };
-  try {
-    const ok = crypto.timingSafeEqual(a, b);
-    return { ok, enforced: true, reason: ok ? undefined : 'invalid_signature' };
-  } catch (e) {
-    return { ok: false, enforced: true, reason: 'invalid_signature' };
+  let ok = false;
+  for (const secret of secrets) {
+    const digest = crypto.createHmac('sha256', secret).update(getRawBody(event)).digest('base64');
+    const a = Buffer.from(digest);
+    if (a.length !== b.length) continue;
+    try {
+      const matches = crypto.timingSafeEqual(a, b);
+      ok = matches || ok;
+    } catch (e) {
+      // Keep checking configured overlap secrets; malformed input remains a
+      // uniform invalid-signature result.
+    }
   }
+  return { ok, enforced: true, reason: ok ? undefined : 'invalid_signature' };
 }
 
 function idempotencyKey(event) {
