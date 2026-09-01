@@ -218,6 +218,7 @@ const processWebhook = async (event, context) => {
     const labels = [];
     const registryEntries = [];
     const productionNotes = [];
+    const productionKinds = [];
 
     for (const item of order.line_items) {
       console.log(`📝 Processing item: ${item.name}`);
@@ -232,6 +233,7 @@ const processWebhook = async (event, context) => {
 
       const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
       const type = props._quiz_type || 'single';
+      productionKinds.push(type);
       const baseBatch = props._quiz_batch || String(Date.now()).slice(-8);
       const customerName = props._quiz_name || order.customer?.first_name || 'Customer';
       const dateStr = props._quiz_date || new Date().toLocaleDateString('de-DE');
@@ -272,6 +274,8 @@ const processWebhook = async (event, context) => {
             name: customerName,
             date: dateStr,
             profile: props[`_quiz_${part.key}_profile`] || 'IDENTÉ Custom',
+            type,
+            volume: '50 ml',
             concentration,
             harmonie: pi === 0 ? harmonie : reducedScore(harmonie, part.dH),
             match: pi === 0 ? match : reducedScore(match, part.dM)
@@ -298,6 +302,8 @@ const processWebhook = async (event, context) => {
           name: customerName,
           date: dateStr,
           profile: props._quiz_profile || 'IDENTÉ Custom',
+          type: 'probe',
+          volume: '2 ml',
           concentration,
           harmonie,
           match
@@ -323,6 +329,8 @@ const processWebhook = async (event, context) => {
           name: customerName,
           date: dateStr,
           profile: props._quiz_profile || 'IDENTÉ Custom',
+          type: 'single',
+          volume: '50 ml',
           concentration,
           harmonie,
           match
@@ -341,7 +349,7 @@ const processWebhook = async (event, context) => {
 
     if (labels.length > 0) {
       console.log(`📧 Sending ${labels.length} labels via email`);
-      await sendEmail(order, labels, productionNotes);
+      await sendEmail(order, labels, productionNotes, productionKinds);
       // Best effort, never fails the webhook: archive PDFs + formula snapshots
       await persistArtifacts(event, order, labels, registryEntries);
       console.log('✅ Success!');
@@ -497,12 +505,22 @@ exports.handler = async (event, context) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function generateQRUrl(data) {
-  const qd = { b: data.batch, n: data.name, d: data.date, c: data.concentration, h: data.harmonie, m: data.match };
-  const json = JSON.stringify(qd);
-  const encoded = encodeURIComponent(json);
-  const replaced = encoded.replace(/%([0-9A-F]{2})/g, (m, p1) => String.fromCharCode(parseInt(p1, 16)));
-  const b64 = Buffer.from(replaced).toString('base64');
-  return 'https://tryidente.com/pages/verify?d=' + b64;
+  const qd = {
+    b: data.batch,
+    n: data.name,
+    d: data.date,
+    c: data.concentration,
+    h: data.harmonie,
+    m: data.match,
+    p: data.profile || undefined,
+    t: data.type || undefined,
+    v: data.volume || undefined
+  };
+  // Base64 must contain the original UTF-8 JSON bytes. The previous
+  // percent-decode + Buffer path encoded non-ASCII bytes twice, which made
+  // names such as "Şule Ünal-Özdemir" appear as mojibake on the verify page.
+  const b64 = Buffer.from(JSON.stringify(qd), 'utf8').toString('base64');
+  return 'https://tryidente.com/pages/verify?d=' + encodeURIComponent(b64);
 }
 
 function getShortProfileName(profile) {
@@ -912,6 +930,7 @@ async function persistArtifacts(event, order, labels, registryEntries) {
         type: entry.type,
         qty: entry.qty,
         profile: entry.data.profile,
+        volume: entry.data.volume,
         name: entry.data.name,
         date: entry.data.date,
         concentration: entry.data.concentration,
@@ -936,16 +955,27 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-async function sendEmail(order, labels, productionNotes) {
+function describeProductionKinds(kinds, labelCount) {
+  const unique = [...new Set(kinds || [])];
+  if (unique.length !== 1) return `MIXED ORDER (${labelCount} Dateien)`;
+  if (unique[0] === 'bundle') return 'TRIO BUNDLE (3 Etiketten)';
+  if (unique[0] === 'duo') return 'DUO (2 Etiketten)';
+  if (unique[0] === 'probe') return 'PROBE (2-ml-Produktionsblatt)';
+  return `${labelCount} Etikett${labelCount > 1 ? 'en' : ''}`;
+}
+
+async function sendEmail(order, labels, productionNotes, productionKinds) {
   const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
   });
 
   const notes = productionNotes || [];
-  const isBundle = labels.length === 3;
-  const isDuo = labels.length === 2;
-  const kind = isBundle ? 'TRIO BUNDLE (3 Etiketten)' : isDuo ? 'DUO (2 Etiketten)' : `${labels.length} Etikett${labels.length > 1 ? 'en' : ''}`;
+  const uniqueKinds = [...new Set(productionKinds || [])];
+  const isBundle = uniqueKinds.length === 1 && uniqueKinds[0] === 'bundle';
+  const isDuo = uniqueKinds.length === 1 && uniqueKinds[0] === 'duo';
+  const isProbe = uniqueKinds.length === 1 && uniqueKinds[0] === 'probe';
+  const kind = describeProductionKinds(productionKinds, labels.length);
   const subject = `IDENTE Order #${order.order_number} - ${kind}`;
 
   const fileList = labels
@@ -960,7 +990,7 @@ async function sendEmail(order, labels, productionNotes) {
     to: process.env.LABEL_EMAIL || process.env.EMAIL_USER,
     subject: subject,
     html: `
-      <h2>Neue ${isBundle ? 'TRIO BUNDLE ' : isDuo ? 'DUO ' : ''}Order!</h2>
+      <h2>Neue ${isBundle ? 'TRIO BUNDLE ' : isDuo ? 'DUO ' : isProbe ? 'PROBE ' : ''}Order!</h2>
       <p><strong>Order:</strong> #${escapeHtml(order.order_number)}</p>
       <p><strong>Kunde:</strong> ${escapeHtml(order.customer?.first_name || '')} ${escapeHtml(order.customer?.last_name || '')}</p>
       <p><strong>Etiketten:</strong> ${labels.length}</p>
@@ -975,4 +1005,4 @@ async function sendEmail(order, labels, productionNotes) {
 }
 
 // Exposed for local testing only - not used by the webhook path
-exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml };
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds };

@@ -28,6 +28,10 @@ function check(name, cond, extra) {
   else { failed++; console.error(`  ✘ ${name}${extra ? ' — ' + extra : ''}`); }
 }
 function isPdf(buf) { return Buffer.isBuffer(buf) && buf.slice(0, 5).toString() === '%PDF-'; }
+function decodeQrUrl(url) {
+  const encoded = new URL(url).searchParams.get('d');
+  return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+}
 
 const FORMULA_50 = {
   top: [{ name: 'Bergamot', weight: 0.8 }, { name: 'Ginger', weight: 0.6 }, { name: 'Pink Pepper', weight: 0.8 }],
@@ -61,6 +65,15 @@ async function main() {
   check('fileSafeName strips bad chars', T.fileSafeName('A/b\\c:d*e') === 'A-b-c-d-e');
   check('fileSafeName empty fallback', T.fileSafeName('///') === 'Customer');
   check('escapeHtml', T.escapeHtml('<b>&"\'') === '&lt;b&gt;&amp;&quot;&#39;');
+  check('email kind is based on products, not attachment count',
+    T.describeProductionKinds(['single', 'single'], 2) === '2 Etiketten');
+  const unicodeQr = decodeQrUrl(T.generateQRUrl({
+    batch: '12345678', name: 'Şule Ünal-Özdemir 🌸', date: '31.8.2026',
+    concentration: 22, harmonie: '91', match: '95',
+    profile: 'IDENTÉ Date', type: 'single', volume: '50 ml'
+  }));
+  check('QR keeps Unicode exactly', unicodeQr.n === 'Şule Ünal-Özdemir 🌸', unicodeQr.n);
+  check('QR carries profile/type/volume', unicodeQr.p === 'IDENTÉ Date' && unicodeQr.t === 'single' && unicodeQr.v === '50 ml');
 
   // resolveFormula falls back on manipulated (negative) weights
   const bad = JSON.stringify({ top: [{ name: 'X', weight: -5 }], heart: [], base: [] });
@@ -81,7 +94,36 @@ async function main() {
   check('missing header rejected', T.verifyShopifyHmac({ headers: {}, body }).ok === false);
   const b64 = { headers: { 'x-shopify-hmac-sha256': sig }, body: Buffer.from(body, 'utf8').toString('base64'), isBase64Encoded: true };
   check('base64 body verified', T.verifyShopifyHmac(b64).ok === true);
+  sentEmails.length = 0;
+  const rejected = await fn.handler({
+    body,
+    headers: { 'x-shopify-hmac-sha256': 'invalid' }
+  }, {});
+  check('handler rejects invalid HMAC before side effects', rejected.statusCode === 401 && sentEmails.length === 0);
   delete process.env.SHOPIFY_WEBHOOK_SECRET;
+
+  // ── idempotency lease state machine ─────────────────────────────────────
+  console.log('idempotency:');
+  check('fresh lease acquired', await T.acquireLease({
+    set: async () => ({ modified: true })
+  }, 'fresh') === 'acquired');
+  check('completed webhook ignored', await T.acquireLease({
+    set: async () => ({ modified: false }),
+    getWithMetadata: async () => ({ data: { status: 'done', at: Date.now() }, etag: 'done' })
+  }, 'done') === 'done');
+  check('active lease reports in-progress', await T.acquireLease({
+    set: async () => ({ modified: false }),
+    getWithMetadata: async () => ({ data: { status: 'processing', at: Date.now() }, etag: 'active' })
+  }, 'active') === 'in-progress');
+  let takeoverEtag = null;
+  check('stale lease is atomically taken over', await T.acquireLease({
+    set: async (_key, _value, opts) => {
+      if (opts.onlyIfNew) return { modified: false };
+      takeoverEtag = opts.onlyIfMatch;
+      return { modified: true };
+    },
+    getWithMetadata: async () => ({ data: { status: 'processing', at: Date.now() - 20 * 60 * 1000 }, etag: 'stale-etag' })
+  }, 'stale') === 'acquired' && takeoverEtag === 'stale-etag');
 
   // ── single order ──────────────────────────────────────────────────────────
   console.log('single:');
@@ -173,6 +215,7 @@ async function main() {
   check('probe: 200', res.statusCode === 200, res.body);
   check('probe: 1 attachment', sentEmails[0].attachments.length === 1);
   check('probe: PROBE filename', sentEmails[0].attachments[0].filename.startsWith('IDENTE-PROBE-'));
+  check('probe: subject says PROBE', sentEmails[0].subject.includes('PROBE'), sentEmails[0].subject);
   check('probe: production note in email', sentEmails[0].html.includes('PROBE 2 ml'));
   check('probe: is PDF', isPdf(sentEmails[0].attachments[0].content));
   fs.writeFileSync(path.join(OUT, 'probe-sheet.pdf'), sentEmails[0].attachments[0].content);
@@ -216,6 +259,7 @@ async function main() {
   ])));
   check('mixed: 200', res.statusCode === 200, res.body);
   check('mixed: 4 attachments', sentEmails[0].attachments.length === 4, String(sentEmails[0].attachments.length));
+  check('mixed: subject is not mislabeled as bundle', sentEmails[0].subject.includes('MIXED ORDER'), sentEmails[0].subject);
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
