@@ -6,6 +6,38 @@ const ALLOWED_ORIGINS = new Set([
   'https://www.tryidente.com',
   'https://tryidente.myshopify.com'
 ]);
+const PREVIEW_HOST_SUFFIX = '--sprightly-empanada-8e68ab.netlify.app';
+
+function previewTokenMatches(request) {
+  const configured = String(process.env.IDENTE_E2E_PREVIEW_TOKEN || '');
+  const given = String(request.headers.get('x-idente-preview-token') || '');
+  if (configured.length < 24 || configured.length !== given.length) return false;
+  let mismatch = 0;
+  for (let index = 0; index < configured.length; index += 1) {
+    mismatch |= configured.charCodeAt(index) ^ given.charCodeAt(index);
+  }
+  return mismatch === 0;
+}
+
+function isPreviewHost(request) {
+  const host = new URL(request.url).hostname.toLowerCase();
+  return host.endsWith(PREVIEW_HOST_SUFFIX) && host !== PREVIEW_HOST_SUFFIX.slice(2);
+}
+
+function registryStoreName(request) {
+  const previewToken = request.headers.get('x-idente-preview-token');
+  if (!isPreviewHost(request)) {
+    if (previewToken) throw new Error('Invalid preview test target');
+    return REGISTRY_STORE;
+  }
+  if (!previewTokenMatches(request)) throw new Error('Invalid preview test target');
+  const namespace = String(process.env.IDENTE_STORE_NAMESPACE || '').trim();
+  if (!namespace) throw new Error('A non-production persistence namespace is required');
+  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(namespace)) {
+    throw new Error('Invalid non-production persistence namespace');
+  }
+  return `${REGISTRY_STORE}-${namespace}`;
+}
 
 function responseHeaders(origin) {
   const headers = {
@@ -50,9 +82,14 @@ function publicRecord(record, requestedBatch) {
 
 export async function handleVerify(request, dependencies = {}) {
   const origin = request.headers.get('origin') || '';
+  const previewAttempt = request.headers.get('x-idente-preview-token');
+  const previewHost = isPreviewHost(request);
 
   if (origin && !ALLOWED_ORIGINS.has(origin)) {
     return json(403, { confirmed: false, reason: 'origin_not_allowed' }, origin);
+  }
+  if ((previewHost || previewAttempt) && !(previewHost && previewTokenMatches(request))) {
+    return json(403, { confirmed: false, reason: 'preview_token_invalid' }, origin);
   }
 
   if (request.method === 'OPTIONS') {
@@ -69,7 +106,7 @@ export async function handleVerify(request, dependencies = {}) {
 
   try {
     const getStoreFn = dependencies.getStore || getStore;
-    const store = getStoreFn({ name: REGISTRY_STORE });
+    const store = getStoreFn({ name: registryStoreName(request) });
     const record = await store.get(`batch-${batch}`, { type: 'json' });
     if (!record) {
       return json(404, { confirmed: false, reason: 'not_registered' }, origin);
@@ -83,4 +120,4 @@ export async function handleVerify(request, dependencies = {}) {
 
 export default async (request) => handleVerify(request);
 
-export const _test = { ALLOWED_ORIGINS, publicRecord, responseHeaders };
+export const _test = { ALLOWED_ORIGINS, publicRecord, responseHeaders, registryStoreName, previewTokenMatches, isPreviewHost };

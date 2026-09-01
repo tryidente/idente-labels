@@ -15,6 +15,9 @@ const sentEmails = [];
 nodemailer.createTransport = () => ({
   sendMail: async (opts) => { sentEmails.push(opts); return { messageId: 'test' }; }
 });
+process.env.EMAIL_USER = process.env.EMAIL_USER || 'labels@example.test';
+process.env.EMAIL_PASS = process.env.EMAIL_PASS || 'test-only';
+process.env.LABEL_EMAIL = process.env.LABEL_EMAIL || 'production@example.test';
 
 const fn = require('../netlify/functions/generate-labels.js');
 const T = fn._test;
@@ -102,6 +105,62 @@ async function main() {
   check('escapeHtml', T.escapeHtml('<b>&"\'') === '&lt;b&gt;&amp;&quot;&#39;');
   check('email kind is based on products, not attachment count',
     T.describeProductionKinds(['single', 'single'], 2) === '2 Etiketten');
+  const previousEmailTransport = process.env.IDENTE_EMAIL_TRANSPORT;
+  process.env.IDENTE_EMAIL_TRANSPORT = 'json';
+  check('deploy preview can exercise mail assembly without delivery',
+    T.mailTransportOptions(true).jsonTransport === true);
+  check('non-preview request cannot enable JSON mail transport',
+    T.mailTransportOptions(false).service === 'gmail' && !T.mailTransportOptions(false).jsonTransport);
+  delete process.env.IDENTE_EMAIL_TRANSPORT;
+  let rejectedUnsafePreviewMail = false;
+  try { T.mailTransportOptions(true); } catch { rejectedUnsafePreviewMail = true; }
+  check('deploy preview cannot fall back to real mail transport', rejectedUnsafePreviewMail);
+  process.env.IDENTE_EMAIL_TRANSPORT = 'json';
+  process.env.IDENTE_REQUIRE_PERSISTENCE = 'true';
+  process.env.IDENTE_STORE_NAMESPACE = 'qa-isolated';
+  process.env.IDENTE_E2E_PREVIEW_TOKEN = 'preview-token-12345678901234567890';
+  const previewEvent = { headers: {
+    host: 'qa-123--sprightly-empanada-8e68ab.netlify.app',
+    'x-idente-preview-token': process.env.IDENTE_E2E_PREVIEW_TOKEN
+  } };
+  const productionEvent = { headers: {
+    host: 'sprightly-empanada-8e68ab.netlify.app',
+    'x-idente-preview-token': process.env.IDENTE_E2E_PREVIEW_TOKEN
+  } };
+  check('deploy preview persistence is isolated from production stores',
+    T.runtimeStoreName('batch-registry', previewEvent) === 'batch-registry-qa-isolated');
+  check('matching raw URL, Host and forwarded Host are accepted', !T.hasRequestHostConflict({
+    rawUrl: 'https://qa-123--sprightly-empanada-8e68ab.netlify.app/.netlify/functions/generate-labels',
+    headers: {
+      host: 'qa-123--sprightly-empanada-8e68ab.netlify.app',
+      'x-forwarded-host': 'qa-123--sprightly-empanada-8e68ab.netlify.app'
+    }
+  }));
+  check('conflicting Host signals are rejected', T.hasRequestHostConflict({
+    rawUrl: 'https://qa-123--sprightly-empanada-8e68ab.netlify.app/.netlify/functions/generate-labels',
+    headers: {
+      host: 'qa-123--sprightly-empanada-8e68ab.netlify.app',
+      'x-forwarded-host': 'sprightly-empanada-8e68ab.netlify.app'
+    }
+  }));
+  const asciiPreviewToken = process.env.IDENTE_E2E_PREVIEW_TOKEN;
+  process.env.IDENTE_E2E_PREVIEW_TOKEN = 'a'.repeat(24) + 'é';
+  check('Unicode preview token byte mismatch fails closed without throwing',
+    T.isIsolatedPreviewRequest({ headers: {
+      host: 'qa-123--sprightly-empanada-8e68ab.netlify.app',
+      'x-idente-preview-token': 'a'.repeat(24) + 'x'
+    } }) === false);
+  process.env.IDENTE_E2E_PREVIEW_TOKEN = asciiPreviewToken;
+  check('production host ignores preview persistence namespace',
+    T.runtimeStoreName('batch-registry', productionEvent) === 'batch-registry');
+  delete process.env.IDENTE_STORE_NAMESPACE;
+  delete process.env.IDENTE_REQUIRE_PERSISTENCE;
+  let rejectedSharedPreviewStore = false;
+  try { T.runtimeStoreName('batch-registry', previewEvent); } catch { rejectedSharedPreviewStore = true; }
+  check('preview persistence can never fall back to production stores', rejectedSharedPreviewStore);
+  delete process.env.IDENTE_E2E_PREVIEW_TOKEN;
+  if (previousEmailTransport == null) delete process.env.IDENTE_EMAIL_TRANSPORT;
+  else process.env.IDENTE_EMAIL_TRANSPORT = previousEmailTransport;
   const unicodeQr = decodeQrUrl(T.generateQRUrl({
     batch: '12345678', name: 'Şule Ünal-Özdemir 🌸', date: '31.8.2026',
     concentration: 22, harmonie: '91', match: '95',
@@ -197,6 +256,43 @@ async function main() {
   let envelopeResult = await fn.handler(signedShopifyEvent(paidEnvelopeOrder), {});
   check('handler accepts signed paid topic before normal processing',
     envelopeResult.statusCode === 200 && sentEmails.length === 0, envelopeResult.body);
+  process.env.IDENTE_E2E_PREVIEW_TOKEN = 'preview-token-12345678901234567890';
+  const noTokenPreviewHost = signedShopifyEvent(paidEnvelopeOrder);
+  noTokenPreviewHost.headers.host = 'qa-123--sprightly-empanada-8e68ab.netlify.app';
+  envelopeResult = await fn.handler(noTokenPreviewHost, {});
+  check('preview host requires a valid preview token before side effects',
+    envelopeResult.statusCode === 403 && sentEmails.length === 0, envelopeResult.body);
+  const conflictingPreviewHost = signedShopifyEvent(paidEnvelopeOrder);
+  conflictingPreviewHost.rawUrl = 'https://qa-123--sprightly-empanada-8e68ab.netlify.app/.netlify/functions/generate-labels';
+  conflictingPreviewHost.headers.host = 'qa-123--sprightly-empanada-8e68ab.netlify.app';
+  conflictingPreviewHost.headers['x-forwarded-host'] = 'sprightly-empanada-8e68ab.netlify.app';
+  conflictingPreviewHost.headers['x-idente-preview-token'] = process.env.IDENTE_E2E_PREVIEW_TOKEN;
+  envelopeResult = await fn.handler(conflictingPreviewHost, {});
+  check('conflicting preview Host signals are rejected before HMAC or side effects',
+    envelopeResult.statusCode === 403 && sentEmails.length === 0, envelopeResult.body);
+  const isolatedPreview = signedShopifyEvent(paidEnvelopeOrder);
+  isolatedPreview.headers.host = 'qa-123--sprightly-empanada-8e68ab.netlify.app';
+  isolatedPreview.headers['x-idente-preview-token'] = process.env.IDENTE_E2E_PREVIEW_TOKEN;
+  delete process.env.IDENTE_STORE_NAMESPACE;
+  process.env.IDENTE_EMAIL_TRANSPORT = 'json';
+  envelopeResult = await fn.handler(isolatedPreview, {});
+  check('preview host rejects a missing persistence namespace before side effects',
+    envelopeResult.statusCode === 503 && sentEmails.length === 0, envelopeResult.body);
+  process.env.IDENTE_STORE_NAMESPACE = 'qa-handler';
+  delete process.env.IDENTE_EMAIL_TRANSPORT;
+  envelopeResult = await fn.handler(isolatedPreview, {});
+  check('preview host rejects real mail transport before side effects',
+    envelopeResult.statusCode === 503 && sentEmails.length === 0, envelopeResult.body);
+  delete process.env.IDENTE_STORE_NAMESPACE;
+  const wrongPreviewTarget = signedShopifyEvent(paidEnvelopeOrder);
+  wrongPreviewTarget.headers.host = 'sprightly-empanada-8e68ab.netlify.app';
+  wrongPreviewTarget.headers['x-idente-preview-token'] = process.env.IDENTE_E2E_PREVIEW_TOKEN;
+  envelopeResult = await fn.handler(wrongPreviewTarget, {});
+  check('preview test header is rejected on production host before side effects',
+    envelopeResult.statusCode === 403 && sentEmails.length === 0, envelopeResult.body);
+  delete process.env.IDENTE_E2E_PREVIEW_TOKEN;
+  if (previousEmailTransport == null) delete process.env.IDENTE_EMAIL_TRANSPORT;
+  else process.env.IDENTE_EMAIL_TRANSPORT = previousEmailTransport;
   envelopeResult = await fn.handler(signedShopifyEvent(paidEnvelopeOrder, 'orders/create'), {});
   check('handler rejects legacy orders/create before production side effects',
     envelopeResult.statusCode === 400 && sentEmails.length === 0, envelopeResult.body);

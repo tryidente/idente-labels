@@ -485,7 +485,7 @@ const processWebhook = async (event, context) => {
       // webhook instead of silently keeping an unrelated historical snapshot.
       await persistArtifacts(event, order, labels, registryEntries);
       console.log(`📧 Sending ${labels.length} labels via email`);
-      await sendEmail(order, labels, productionNotes, productionKinds);
+      await sendEmail(order, labels, productionNotes, productionKinds, isIsolatedPreviewRequest(event));
       console.log('✅ Success!');
     } else {
       console.log('⚠️ No labels generated');
@@ -515,6 +515,56 @@ const processWebhook = async (event, context) => {
 
 const LEASE_MS = 10 * 60 * 1000;    // stale takeover after 10 min (fn timeout is far lower)
 const IDEMPOTENCY_STORE = 'webhook-idempotency';
+const PREVIEW_HOST_SUFFIX = '--sprightly-empanada-8e68ab.netlify.app';
+
+function normalizeRequestHost(value) {
+  return String(value || '').split(',')[0].trim().toLowerCase().replace(/:\d+$/, '');
+}
+
+function requestHostSignals(event) {
+  const headers = event && event.headers || {};
+  let rawUrlHost = '';
+  try {
+    rawUrlHost = event?.rawUrl ? new URL(event.rawUrl).hostname.toLowerCase() : '';
+  } catch {
+    rawUrlHost = '';
+  }
+  return [
+    rawUrlHost,
+    normalizeRequestHost(headers.host || headers.Host),
+    normalizeRequestHost(headers['x-forwarded-host'] || headers['X-Forwarded-Host'])
+  ].filter(Boolean);
+}
+
+function hasRequestHostConflict(event) {
+  return new Set(requestHostSignals(event)).size > 1;
+}
+
+function requestHost(event) {
+  const hosts = requestHostSignals(event);
+  return hasRequestHostConflict(event) ? '' : hosts[0] || '';
+}
+
+function requestPreviewToken(event) {
+  const headers = event && event.headers || {};
+  return String(headers['x-idente-preview-token'] || headers['X-Idente-Preview-Token'] || '');
+}
+
+function isPreviewHost(event) {
+  const host = requestHost(event);
+  return host.endsWith(PREVIEW_HOST_SUFFIX) && host !== PREVIEW_HOST_SUFFIX.slice(2);
+}
+
+function isIsolatedPreviewRequest(event) {
+  const configured = String(process.env.IDENTE_E2E_PREVIEW_TOKEN || '');
+  const given = requestPreviewToken(event);
+  if (!isPreviewHost(event)) return false;
+  if (configured.length < 24 || configured.length !== given.length) return false;
+  const configuredBytes = Buffer.from(configured, 'utf8');
+  const givenBytes = Buffer.from(given, 'utf8');
+  if (configuredBytes.length !== givenBytes.length) return false;
+  return crypto.timingSafeEqual(configuredBytes, givenBytes);
+}
 
 // Netlify may deliver the body base64-encoded; HMAC must be computed over the
 // exact raw bytes Shopify signed, and JSON.parse must see the same bytes.
@@ -573,7 +623,7 @@ function getIdempotencyStore(event) {
     // writes (onlyIfNew / onlyIfMatch), which are evaluated atomically at the
     // origin regardless of read consistency - a stale read can only turn a
     // duplicate's response into a 409 retry, never into a second processing.
-    return netlifyBlobs.getStore({ name: IDEMPOTENCY_STORE });
+    return netlifyBlobs.getStore({ name: runtimeStoreName(IDEMPOTENCY_STORE, event) });
   } catch (e) {
     console.log('Idempotency store unavailable, processing without dedupe:', e.message);
     return null;
@@ -601,6 +651,27 @@ async function acquireLease(store, key) {
 }
 
 exports.handler = async (event, context) => {
+  if (hasRequestHostConflict(event)) {
+    return { statusCode: 403, body: JSON.stringify({ error: 'Invalid request host' }) };
+  }
+  const previewRequest = isIsolatedPreviewRequest(event);
+  if ((isPreviewHost(event) || requestPreviewToken(event)) && !previewRequest) {
+    return { statusCode: 403, body: JSON.stringify({ error: 'Invalid preview test target' }) };
+  }
+  if (previewRequest) {
+    try {
+      // A preview must prove all isolation controls before HMAC verification,
+      // lease acquisition, Blob writes, PDF generation or mail assembly.
+      runtimeStoreName(IDEMPOTENCY_STORE, event);
+      mailTransportOptions(true);
+      const from = String(process.env.EMAIL_USER || '').trim();
+      const to = String(process.env.LABEL_EMAIL || from).trim();
+      if (!from || !to) throw new Error('Preview mail envelope is not configured');
+    } catch (error) {
+      console.error('Preview isolation configuration rejected:', error.message);
+      return { statusCode: 503, body: JSON.stringify({ error: 'Preview test isolation is not configured' }) };
+    }
+  }
   const hmac = verifyShopifyHmac(event);
   if (!hmac.ok) {
     if (hmac.reason === 'missing_secret') {
@@ -685,6 +756,18 @@ function generateQRUrl(data) {
 
 function productionPersistenceRequired() {
   return process.env.CONTEXT === 'production' || process.env.IDENTE_REQUIRE_PERSISTENCE === 'true';
+}
+
+function runtimeStoreName(baseName, event) {
+  if (!isIsolatedPreviewRequest(event)) return baseName;
+  const namespace = String(process.env.IDENTE_STORE_NAMESPACE || '').trim();
+  if (!namespace) {
+    throw new Error('A non-production persistence namespace is required');
+  }
+  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(namespace)) {
+    throw new Error('Invalid non-production persistence namespace');
+  }
+  return `${baseName}-${namespace}`;
 }
 
 function getShortProfileName(profile) {
@@ -1117,8 +1200,8 @@ async function persistArtifacts(event, order, labels, registryEntries) {
     if (typeof netlifyBlobs.connectLambda === 'function' && event && event.blobs) {
       netlifyBlobs.connectLambda(event);
     }
-    labelStore = netlifyBlobs.getStore({ name: LABELS_STORE });
-    registryStore = netlifyBlobs.getStore({ name: REGISTRY_STORE });
+    labelStore = netlifyBlobs.getStore({ name: runtimeStoreName(LABELS_STORE, event) });
+    registryStore = netlifyBlobs.getStore({ name: runtimeStoreName(REGISTRY_STORE, event) });
   } catch (e) {
     if (required) throw new Error(`Persistence stores unavailable: ${e.message}`);
     console.log('Persistence stores unavailable in local context, skipping archive:', e.message);
@@ -1184,11 +1267,11 @@ function describeProductionKinds(kinds, labelCount) {
   return `${labelCount} Etikett${labelCount > 1 ? 'en' : ''}`;
 }
 
-async function sendEmail(order, labels, productionNotes, productionKinds) {
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
-  });
+async function sendEmail(order, labels, productionNotes, productionKinds, previewRequest = false) {
+  const transporter = nodemailer.createTransport(mailTransportOptions(previewRequest));
+  const from = String(process.env.EMAIL_USER || '').trim();
+  const to = String(process.env.LABEL_EMAIL || from).trim();
+  if (!from || !to) throw new Error('Production mail sender/recipient is not configured');
 
   const notes = productionNotes || [];
   const uniqueKinds = [...new Set(productionKinds || [])];
@@ -1205,9 +1288,9 @@ async function sendEmail(order, labels, productionNotes, productionKinds) {
     ? `<p style="color: #9c6626; font-weight: bold;">${notes.map(escapeHtml).join('<br>')}</p>`
     : '';
 
-  await transporter.sendMail({
-    from: process.env.EMAIL_USER,
-    to: process.env.LABEL_EMAIL || process.env.EMAIL_USER,
+  const mailResult = await transporter.sendMail({
+    from,
+    to,
     subject: subject,
     html: `
       <h2>Neue ${isBundle ? 'TRIO BUNDLE ' : isDuo ? 'DUO ' : isProbe ? 'PROBE ' : ''}Order!</h2>
@@ -1222,7 +1305,30 @@ async function sendEmail(order, labels, productionNotes, productionKinds) {
     `,
     attachments: labels.map(l => ({ filename: l.filename, content: l.content }))
   });
+  if (previewRequest) {
+    const envelope = mailResult && mailResult.envelope;
+    if (!mailResult || !mailResult.message || !envelope?.from || !envelope?.to?.length) {
+      throw new Error('Preview mail assembly did not produce a complete envelope');
+    }
+  }
+}
+
+function mailTransportOptions(previewRequest = false) {
+  // Deploy previews need a complete pipeline test without sending a synthetic
+  // production email. JSON transport exercises Nodemailer's full message and
+  // attachment assembly locally inside the function. Production can never
+  // opt into this bypass, even if the preview-only flag is copied by mistake.
+  if (previewRequest) {
+    if (process.env.IDENTE_EMAIL_TRANSPORT !== 'json') {
+      throw new Error('Preview mail transport must be isolated JSON');
+    }
+    return { jsonTransport: true };
+  }
+  return {
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+  };
 }
 
 // Exposed for local testing only - not used by the webhook path
-exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, printableLabelName, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds, resolveVariantType, parseConcentration, validateBatch, formulaDigest, productionPersistenceRequired, canonicalMaterialName, formulaApprovalRequired, approvedFormulaHashes, assertFormulaApproved, registryRecordMatches, writeRegistryEntry, assertProductionReadyOrder, validateProductionWebhook };
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, printableLabelName, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds, resolveVariantType, parseConcentration, validateBatch, formulaDigest, productionPersistenceRequired, runtimeStoreName, normalizeRequestHost, requestHostSignals, hasRequestHostConflict, requestHost, requestPreviewToken, isPreviewHost, isIsolatedPreviewRequest, canonicalMaterialName, formulaApprovalRequired, approvedFormulaHashes, assertFormulaApproved, registryRecordMatches, writeRegistryEntry, assertProductionReadyOrder, validateProductionWebhook, mailTransportOptions };
