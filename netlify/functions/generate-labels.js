@@ -7,8 +7,8 @@ const nodemailer = require('nodemailer');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
 
-// Optional dependency: when Netlify Blobs is unavailable (local runs, missing
-// context) the webhook still processes, just without dedupe (fail-open).
+// Optional dependency for local runs. Production checks below require Blobs
+// and fail closed before any production email when persistence is unavailable.
 let netlifyBlobs = null;
 try { netlifyBlobs = require('@netlify/blobs'); } catch (e) { /* fail-open */ }
 
@@ -298,10 +298,21 @@ function resolveFormula(rawFormulaJson, quizTags, concentration, seed) {
   };
 }
 
+function assertProductionReadyOrder(order) {
+  const status = String(order && order.financial_status || '').trim().toLowerCase();
+  if (status !== 'paid') {
+    throw new Error(`Order is not paid (financial_status: ${status || 'missing'})`);
+  }
+}
+
 const processWebhook = async (event, context) => {
   try {
     console.log('🔔 Webhook received');
     const order = JSON.parse(getRawBody(event).toString('utf8'));
+    // The production subscription must use Shopify's orders/paid topic. Keep
+    // this payload guard as defense in depth so a future webhook
+    // misconfiguration cannot manufacture or email labels for an unpaid order.
+    assertProductionReadyOrder(order);
     console.log(`📦 Order #${order.order_number} from ${order.customer?.first_name || 'Customer'}`);
 
     const labels = [];
@@ -479,8 +490,8 @@ const processWebhook = async (event, context) => {
 //                             where the concurrent attempt ends up failing)
 //   - stale "processing"   -> take over atomically via etag CAS (onlyIfMatch)
 //   - processing failed    -> record is deleted, the next retry runs again
-// If Blobs is unreachable we process WITHOUT dedupe: a duplicate email is
-// recoverable, a silently dropped order is not.
+// In Production, missing/unreachable Blobs fails closed before processing.
+// Local/test contexts may continue without dedupe for deterministic QA.
 
 const LEASE_MS = 10 * 60 * 1000;    // stale takeover after 10 min (fn timeout is far lower)
 const IDEMPOTENCY_STORE = 'webhook-idempotency';
@@ -1185,4 +1196,4 @@ async function sendEmail(order, labels, productionNotes, productionKinds) {
 }
 
 // Exposed for local testing only - not used by the webhook path
-exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, printableLabelName, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds, resolveVariantType, parseConcentration, validateBatch, formulaDigest, productionPersistenceRequired, canonicalMaterialName, formulaApprovalRequired, approvedFormulaHashes, assertFormulaApproved, registryRecordMatches, writeRegistryEntry };
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, printableLabelName, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds, resolveVariantType, parseConcentration, validateBatch, formulaDigest, productionPersistenceRequired, canonicalMaterialName, formulaApprovalRequired, approvedFormulaHashes, assertFormulaApproved, registryRecordMatches, writeRegistryEntry, assertProductionReadyOrder };

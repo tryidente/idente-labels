@@ -57,6 +57,7 @@ const TYPE_VARIANTS = {
 function makeOrder(lineItems, orderNumber = 4711) {
   return {
     order_number: orderNumber,
+    financial_status: 'paid',
     customer: { first_name: 'Test', last_name: 'Kunde <b>x</b>' },
     line_items: lineItems.map(item => {
       const typeProperty = (item.properties || []).find(property => property.name === '_quiz_type');
@@ -122,6 +123,12 @@ async function main() {
     T.canonicalMaterialName('Birke') === 'Birch Tar' &&
     T.canonicalMaterialName('Guaiac Wood') === 'Guaiacwood' &&
     T.canonicalMaterialName('Tee') === 'Tea');
+  check('paid order is production-ready', T.assertProductionReadyOrder({ financial_status: 'paid' }) === undefined);
+  for (const financialStatus of ['pending', 'authorized', 'partially_paid', '']) {
+    let rejectedUnpaid = false;
+    try { T.assertProductionReadyOrder({ financial_status: financialStatus }); } catch { rejectedUnpaid = true; }
+    check(`production rejects ${financialStatus || 'missing'} financial status`, rejectedUnpaid);
+  }
   const approvedDigest = T.formulaDigest(T.usableFormula(FORMULA_50, 11));
   process.env.IDENTE_REQUIRE_FORMULA_APPROVAL = 'true';
   delete process.env.IDENTE_APPROVED_FORMULA_HASHES;
@@ -351,6 +358,19 @@ async function main() {
 
   // ── adversarial production-contract checks ───────────────────────────────
   console.log('contract hardening:');
+  sentEmails.length = 0;
+  const unpaidOrder = makeOrder([{
+    name: 'Single pending payment', quantity: 1,
+    properties: props({
+      _quiz_batch: '11110001', _quiz_name: 'Pending', _quiz_profile: 'IDENTÉ Alltag',
+      _quiz_concentration: '22', _quiz_formula: JSON.stringify(FORMULA_50)
+    })
+  }], 4800);
+  unpaidOrder.financial_status = 'pending';
+  res = await T.processWebhook(event(unpaidOrder));
+  check('unpaid order is rejected before artifact/email side effects',
+    res.statusCode === 500 && sentEmails.length === 0 && res.body.includes('Order is not paid'), res.body);
+
   sentEmails.length = 0;
   res = await T.processWebhook(event(makeOrder([{
     variant_id: TYPE_VARIANTS.probe,
