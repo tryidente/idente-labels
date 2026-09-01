@@ -72,6 +72,17 @@ function props(obj) {
 function event(order) {
   return { body: JSON.stringify(order), headers: { 'x-shopify-webhook-id': 'test-' + Math.random() } };
 }
+function signedShopifyEvent(order, topic = 'orders/paid', secret = 'shhh') {
+  const body = JSON.stringify(order);
+  return {
+    body,
+    headers: {
+      'x-shopify-webhook-id': 'test-' + Math.random(),
+      'x-shopify-topic': topic,
+      'x-shopify-hmac-sha256': crypto.createHmac('sha256', secret).update(body, 'utf8').digest('base64')
+    }
+  };
+}
 
 async function main() {
   // ── unit helpers ──────────────────────────────────────────────────────────
@@ -179,6 +190,23 @@ async function main() {
   check('missing header rejected', T.verifyShopifyHmac({ headers: {}, body }).ok === false);
   const b64 = { headers: { 'x-shopify-hmac-sha256': sig }, body: Buffer.from(body, 'utf8').toString('base64'), isBase64Encoded: true };
   check('base64 body verified', T.verifyShopifyHmac(b64).ok === true);
+  sentEmails.length = 0;
+  const paidEnvelopeOrder = makeOrder([], 4700);
+  check('orders/paid + paid payload is production webhook',
+    T.validateProductionWebhook(signedShopifyEvent(paidEnvelopeOrder)).ok === true);
+  let envelopeResult = await fn.handler(signedShopifyEvent(paidEnvelopeOrder), {});
+  check('handler accepts signed paid topic before normal processing',
+    envelopeResult.statusCode === 200 && sentEmails.length === 0, envelopeResult.body);
+  envelopeResult = await fn.handler(signedShopifyEvent(paidEnvelopeOrder, 'orders/create'), {});
+  check('handler rejects legacy orders/create before production side effects',
+    envelopeResult.statusCode === 400 && sentEmails.length === 0, envelopeResult.body);
+  const pendingEnvelopeOrder = { ...paidEnvelopeOrder, financial_status: 'pending' };
+  envelopeResult = await fn.handler(signedShopifyEvent(pendingEnvelopeOrder), {});
+  check('handler rejects unpaid orders/paid payload before production side effects',
+    envelopeResult.statusCode === 422 && sentEmails.length === 0, envelopeResult.body);
+  envelopeResult = await fn.handler(signedShopifyEvent(paidEnvelopeOrder, ''), {});
+  check('handler rejects missing topic before production side effects',
+    envelopeResult.statusCode === 400 && sentEmails.length === 0, envelopeResult.body);
   sentEmails.length = 0;
   const rejected = await fn.handler({
     body,

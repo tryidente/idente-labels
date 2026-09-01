@@ -305,6 +305,26 @@ function assertProductionReadyOrder(order) {
   }
 }
 
+function validateProductionWebhook(event) {
+  const headers = event && event.headers || {};
+  const topic = String(headers['x-shopify-topic'] || headers['X-Shopify-Topic'] || '').trim().toLowerCase();
+  if (topic !== 'orders/paid') {
+    return { ok: false, statusCode: 400, error: `Unsupported webhook topic: ${topic || 'missing'}` };
+  }
+  let order;
+  try {
+    order = JSON.parse(getRawBody(event).toString('utf8'));
+  } catch {
+    return { ok: false, statusCode: 400, error: 'Invalid order JSON' };
+  }
+  try {
+    assertProductionReadyOrder(order);
+  } catch (error) {
+    return { ok: false, statusCode: 422, error: error.message };
+  }
+  return { ok: true };
+}
+
 const processWebhook = async (event, context) => {
   try {
     console.log('🔔 Webhook received');
@@ -588,6 +608,15 @@ exports.handler = async (event, context) => {
     }
     console.log('🚫 Webhook HMAC verification failed - rejecting');
     return { statusCode: 401, body: JSON.stringify({ error: 'Invalid webhook signature' }) };
+  }
+  // Topic and payment readiness are checked before any idempotency lease. This
+  // makes the endpoint exclusive to orders/paid and prevents a parallel legacy
+  // orders/create subscription (which has a different webhook ID) from causing
+  // a second production email for the same already-paid order.
+  const envelope = validateProductionWebhook(event);
+  if (!envelope.ok) {
+    console.log(`🚫 Production webhook rejected - ${envelope.error}`);
+    return { statusCode: envelope.statusCode, body: JSON.stringify({ error: envelope.error }) };
   }
   const store = getIdempotencyStore(event);
   if (!store) {
@@ -1196,4 +1225,4 @@ async function sendEmail(order, labels, productionNotes, productionKinds) {
 }
 
 // Exposed for local testing only - not used by the webhook path
-exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, printableLabelName, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds, resolveVariantType, parseConcentration, validateBatch, formulaDigest, productionPersistenceRequired, canonicalMaterialName, formulaApprovalRequired, approvedFormulaHashes, assertFormulaApproved, registryRecordMatches, writeRegistryEntry, assertProductionReadyOrder };
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, printableLabelName, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds, resolveVariantType, parseConcentration, validateBatch, formulaDigest, productionPersistenceRequired, canonicalMaterialName, formulaApprovalRequired, approvedFormulaHashes, assertFormulaApproved, registryRecordMatches, writeRegistryEntry, assertProductionReadyOrder, validateProductionWebhook };
