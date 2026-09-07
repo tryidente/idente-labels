@@ -2,9 +2,12 @@
   "name": "idente-labels",
   "version": "1.0.0",
   "description": "IDENTE Label Generator - 2-Page Professional Labels",
+  "scripts": {
+    "test": "node test/run-tests.js && node test/verify-batch-tests.mjs"
+  },
   "dependencies": {
     "@netlify/blobs": "^11.0.1",
-    "nodemailer": "^6.9.7",
+    "nodemailer": "^9.1.0",
     "pdf-lib": "^1.17.1",
     "qrcode": "^1.5.3"
   }

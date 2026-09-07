@@ -7,8 +7,8 @@ const nodemailer = require('nodemailer');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
 
-// Optional dependency: when Netlify Blobs is unavailable (local runs, missing
-// context) the webhook still processes, just without dedupe (fail-open).
+// Optional dependency for local runs. Production checks below require Blobs
+// and fail closed before any production email when persistence is unavailable.
 let netlifyBlobs = null;
 try { netlifyBlobs = require('@netlify/blobs'); } catch (e) { /* fail-open */ }
 
@@ -84,6 +84,93 @@ const NOTES_DATABASE = {
     { name: "Hedione", tags: ["floral", "fresh", "light", "modern", "unisex", "radiant", "transparent"], intensity: 0.4 }
   ]
 };
+
+// Shopify variant IDs are the server-side authority for the physical product.
+// Line-item properties are customer-controlled and may describe the quiz, but
+// they must never be able to turn a 2 ml sample into a 50 ml bottle (or vice
+// versa). Keep this map in sync with the store before adding a new offer.
+const VARIANT_TYPE = new Map([
+  ['52223237783893', 'single'], // Alltag
+  ['52223237816661', 'single'], // Date
+  ['52223237849429', 'single'], // Business
+  ['52223237882197', 'single'], // Freizeit
+  ['52223237914965', 'bundle'], // Trio
+  ['54803580125525', 'duo'],
+  ['54803580158293', 'probe']
+]);
+
+const ALLOWED_CONCENTRATIONS = new Set([18, 20, 22, 25, 28]);
+
+// The storefront may serialize DE or EN display names. Production records use
+// one canonical legacy material name so locale cannot change the substance.
+const CANONICAL_MATERIALS = new Set(
+  Object.values(NOTES_DATABASE).flat().map(note => note.name)
+);
+const MATERIAL_ALIASES = new Map(Object.entries({
+  Bergamotte: 'Bergamot', Zitrone: 'Lemon', Orange: 'Sweet Orange', Mandarine: 'Mandarin',
+  Minze: 'Mint', 'Grüner Apfel': 'Green Apple', Blackcurrant: 'Cassis',
+  'Rosa Pfeffer': 'Pink Pepper', Kardamom: 'Cardamom', Basilikum: 'Basil',
+  Meerwasser: 'Sea Water', Ingwer: 'Ginger', Jasmin: 'Jasmine',
+  Maiglöckchen: 'Lily of the Valley', Freesie: 'Freesia', Pfingstrose: 'Peony',
+  Lavendel: 'Lavender', Geranie: 'Geranium', Orangenblüte: 'Orange Blossom',
+  Nelke: 'Clove', Carnation: 'Clove', Zimt: 'Cinnamon', Muskatnuss: 'Nutmeg',
+  Safran: 'Saffron', Tonkabohne: 'Tonka Bean', Pfirsich: 'Peach', Pflaume: 'Plum',
+  'Rote Beeren': 'Red Berries', Schokolade: 'Chocolate', Kaffee: 'Coffee',
+  Tabak: 'Tobacco', Tee: 'Tea', Sandelholz: 'Sandalwood', Zedernholz: 'Cedarwood',
+  Guajakholz: 'Guaiacwood', 'Guaiac Wood': 'Guaiacwood', Eichenmoos: 'Oakmoss',
+  Moschus: 'Musk', Vanille: 'Vanilla', Benzoe: 'Benzoin', Weihrauch: 'Frankincense',
+  Leder: 'Leather', Birke: 'Birch Tar', Birch: 'Birch Tar', Wildleder: 'Suede'
+}));
+
+function canonicalMaterialName(name) {
+  const trimmed = typeof name === 'string' ? name.trim() : '';
+  const canonical = MATERIAL_ALIASES.get(trimmed) || trimmed;
+  return CANONICAL_MATERIALS.has(canonical) ? canonical : null;
+}
+
+function formulaApprovalRequired() {
+  return process.env.CONTEXT === 'production' || process.env.IDENTE_REQUIRE_FORMULA_APPROVAL === 'true';
+}
+
+function approvedFormulaHashes() {
+  return new Set(String(process.env.IDENTE_APPROVED_FORMULA_HASHES || '')
+    .split(/[\s,]+/)
+    .map(value => value.trim().toLowerCase())
+    .filter(value => /^[a-f0-9]{64}$/.test(value)));
+}
+
+function assertFormulaApproved(formula) {
+  if (!formulaApprovalRequired()) return;
+  const digest = formulaDigest(formula);
+  if (!approvedFormulaHashes().has(digest)) {
+    throw new Error(`Unapproved quiz formula ${digest}`);
+  }
+}
+
+function resolveVariantType(item, props) {
+  const variantId = String(item && (item.variant_id || item.variantId) || '');
+  const expected = VARIANT_TYPE.get(variantId);
+  if (!expected) throw new Error(`Unsupported quiz variant ${variantId || '(missing)'}`);
+  const claimed = props._quiz_type || 'single';
+  if (claimed !== expected) {
+    throw new Error(`Quiz product/type mismatch for variant ${variantId}: expected ${expected}, got ${claimed}`);
+  }
+  return expected;
+}
+
+function parseConcentration(value) {
+  const concentration = Number(value == null || value === '' ? 22 : value);
+  if (!Number.isInteger(concentration) || !ALLOWED_CONCENTRATIONS.has(concentration)) {
+    throw new Error(`Unsupported quiz concentration ${String(value)}`);
+  }
+  return concentration;
+}
+
+function validateBatch(value) {
+  const batch = String(value || '').trim();
+  if (!/^[A-Za-z0-9-]{4,24}$/.test(batch)) throw new Error('Missing or invalid quiz batch');
+  return batch;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PERSONALIZED FORMULA ALGORITHM
@@ -169,13 +256,90 @@ function generatePersonalizedFormula(quizTags, concentration = 22, seed = 0) {
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Batch numbers from the theme are numeric strings; a non-numeric base must
+// not turn into "NaN" on bundle labels 2/3, so fall back to a suffix.
+function offsetBatch(baseBatch, offset) {
+  if (offset === 0) return String(baseBatch);
+  if (/^\d+$/.test(String(baseBatch))) return String(parseInt(baseBatch, 10) + offset);
+  return `${baseBatch}-${offset + 1}`;
+}
+
+// Harmonie/Match arrive as strings from line-item properties; a non-numeric
+// value must never print as "NaN" on the label or in the QR payload.
+function toScoreString(value, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) ? String(n) : fallback;
+}
+
+function reducedScore(scoreStr, delta) {
+  const n = parseInt(scoreStr, 10);
+  return String(Math.max(80, (Number.isFinite(n) ? n : 90) - delta));
+}
+
+function fileSafeName(name) {
+  return String(name).replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'Customer';
+}
+
+function resolveFormula(rawFormulaJson, quizTags, concentration, seed) {
+  if (!rawFormulaJson) throw new Error('Missing quiz formula');
+  let parsed;
+  try {
+    parsed = JSON.parse(rawFormulaJson);
+  } catch {
+    throw new Error('Invalid quiz formula JSON');
+  }
+  const usable = usableFormula(parsed, 50 * (concentration / 100));
+  if (!usable) throw new Error('Invalid quiz formula');
+  assertFormulaApproved(usable);
+  const totalOil = 50 * (concentration / 100);
+  return {
+    top: usable.top, heart: usable.heart, base: usable.base,
+    oilTotal: totalOil, alcoholTotal: 50 - totalOil, grandTotal: 50
+  };
+}
+
+function assertProductionReadyOrder(order) {
+  const status = String(order && order.financial_status || '').trim().toLowerCase();
+  if (status !== 'paid') {
+    throw new Error(`Order is not paid (financial_status: ${status || 'missing'})`);
+  }
+}
+
+function validateProductionWebhook(event) {
+  const headers = event && event.headers || {};
+  const topic = String(headers['x-shopify-topic'] || headers['X-Shopify-Topic'] || '').trim().toLowerCase();
+  if (topic !== 'orders/paid') {
+    return { ok: false, statusCode: 400, error: `Unsupported webhook topic: ${topic || 'missing'}` };
+  }
+  let order;
+  try {
+    order = JSON.parse(getRawBody(event).toString('utf8'));
+  } catch {
+    return { ok: false, statusCode: 400, error: 'Invalid order JSON' };
+  }
+  try {
+    assertProductionReadyOrder(order);
+  } catch (error) {
+    return { ok: false, statusCode: 422, error: error.message };
+  }
+  return { ok: true };
+}
+
 const processWebhook = async (event, context) => {
   try {
     console.log('🔔 Webhook received');
-    const order = JSON.parse(event.body);
+    const order = JSON.parse(getRawBody(event).toString('utf8'));
+    // The production subscription must use Shopify's orders/paid topic. Keep
+    // this payload guard as defense in depth so a future webhook
+    // misconfiguration cannot manufacture or email labels for an unpaid order.
+    assertProductionReadyOrder(order);
     console.log(`📦 Order #${order.order_number} from ${order.customer?.first_name || 'Customer'}`);
 
     const labels = [];
+    const registryEntries = [];
+    const productionNotes = [];
+    const productionKinds = [];
+    const orderBatches = new Set();
 
     for (const item of order.line_items) {
       console.log(`📝 Processing item: ${item.name}`);
@@ -188,175 +352,140 @@ const processWebhook = async (event, context) => {
       const props = {};
       item.properties.forEach(p => { props[p.name] = p.value; });
 
-      // ═══════════════════════════════════════════════════════════════════════
-      // CHECK IF BUNDLE OR SINGLE PRODUCT
-      // ═══════════════════════════════════════════════════════════════════════
-      
-      if (props._quiz_type === 'bundle') {
-        console.log('📦 BUNDLE ORDER DETECTED - Generating 3 labels');
-        
-        const baseBatch = props._quiz_batch || String(Date.now()).slice(-8);
-        const customerName = props._quiz_name || order.customer?.first_name || 'Customer';
-        const dateStr = props._quiz_date || new Date().toLocaleDateString('de-DE');
-        const concentration = parseInt(props._quiz_concentration) || 22;
-        const harmonie = props._quiz_harmonie || '95';
-        const match = props._quiz_match || '92';
-        
-        // Parse quiz tags
-        let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
-        try {
-          if (props._quiz_tags) quizTags = JSON.parse(props._quiz_tags);
-        } catch (e) { console.log('⚠️ Could not parse quiz tags'); }
-        
-        // ─────────────────────────────────────────────────────────────────────
-        // LABEL 1: Main Perfume
-        // ─────────────────────────────────────────────────────────────────────
-        let mainFormula;
-        try {
-          if (props._quiz_main_formula) {
-            mainFormula = usableFormula(JSON.parse(props._quiz_main_formula)) || generatePersonalizedFormula(quizTags, concentration, 0);
-          } else {
-            mainFormula = generatePersonalizedFormula(quizTags, concentration, 0);
-          }
-        } catch (e) {
-          mainFormula = generatePersonalizedFormula(quizTags, concentration, 0);
+      if (!Object.keys(props).some(key => key.startsWith('_quiz_'))) {
+        console.log('⚠️ No quiz properties found, skipping');
+        continue;
+      }
+
+      const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+      const type = resolveVariantType(item, props);
+      productionKinds.push(type);
+      const baseBatch = validateBatch(props._quiz_batch);
+      const customerName = props._quiz_name || order.customer?.first_name || 'Customer';
+      const dateStr = props._quiz_date || new Date().toLocaleDateString('de-DE');
+      const concentration = parseConcentration(props._quiz_concentration);
+      const harmonie = toScoreString(props._quiz_harmonie, '95');
+      const match = toScoreString(props._quiz_match, '92');
+
+      let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
+      try {
+        if (props._quiz_tags) quizTags = JSON.parse(props._quiz_tags);
+      } catch (e) { console.log('⚠️ Could not parse quiz tags'); }
+
+      if (qty > 1) {
+        productionNotes.push(`Position "${item.name}": Menge ${qty} — Etikett je Einheit ${qty}× drucken.`);
+      }
+
+      if (type === 'bundle' || type === 'duo') {
+        // ═════════════════════════════════════════════════════════════════════
+        // BUNDLE (Trio: 3 labels) / DUO (2 labels) — main + recommendations
+        // ═════════════════════════════════════════════════════════════════════
+        const parts = type === 'bundle'
+          ? [
+              { key: 'main', suffix: 'MAIN', seed: 0, dH: 0, dM: 0 },
+              { key: 'rec1', suffix: 'REC1', seed: 1, dH: 2, dM: 3 },
+              { key: 'rec2', suffix: 'REC2', seed: 2, dH: 4, dM: 5 }
+            ]
+          : [
+              { key: 'main', suffix: 'MAIN', seed: 0, dH: 0, dM: 0 },
+              { key: 'rec1', suffix: 'REC1', seed: 1, dH: 2, dM: 3 }
+            ];
+        console.log(`📦 ${type.toUpperCase()} ORDER DETECTED - Generating ${parts.length} labels`);
+
+        for (let pi = 0; pi < parts.length; pi++) {
+          const part = parts[pi];
+          const formula = resolveFormula(props[`_quiz_${part.key}_formula`], quizTags, concentration, part.seed);
+          const data = {
+            batch: offsetBatch(baseBatch, pi),
+            name: customerName,
+            date: dateStr,
+            profile: props[`_quiz_${part.key}_profile`] || 'IDENTÉ Custom',
+            type,
+            volume: '50 ml',
+            concentration,
+            harmonie: pi === 0 ? harmonie : reducedScore(harmonie, part.dH),
+            match: pi === 0 ? match : reducedScore(match, part.dM)
+          };
+          if (orderBatches.has(data.batch)) throw new Error(`Duplicate batch ${data.batch} in order`);
+          orderBatches.add(data.batch);
+          const pdf = await generateLabelPDF(data, formula);
+          labels.push({
+            filename: `IDENTE-${fileSafeName(customerName)}-${data.batch}-${part.suffix}.pdf`,
+            content: pdf,
+            qty
+          });
+          registryEntries.push({ batch: data.batch, data, formula, type, qty });
+          console.log(`✅ Label ${pi + 1}/${parts.length} generated: ${data.profile}`);
         }
-        
-        const mainData = {
+
+      } else if (type === 'probe') {
+        // ═════════════════════════════════════════════════════════════════════
+        // PROBE (2 ml sample) — production sheet; the physical sample label
+        // layout is pending real bottle/label dimensions and NOT invented here.
+        // ═════════════════════════════════════════════════════════════════════
+        console.log('🧪 PROBE ORDER DETECTED - Generating 2ml production sheet');
+
+        const data = {
           batch: baseBatch,
           name: customerName,
           date: dateStr,
-          profile: props._quiz_main_profile || 'IDENTÉ Custom',
+          profile: props._quiz_profile || 'IDENTÉ Custom',
+          type: 'probe',
+          volume: '2 ml',
           concentration,
           harmonie,
           match
         };
-        
-        const mainPdf = await generateLabelPDF(mainData, mainFormula);
+        if (orderBatches.has(data.batch)) throw new Error(`Duplicate batch ${data.batch} in order`);
+        orderBatches.add(data.batch);
+        const formula = resolveFormula(props._quiz_formula, quizTags, concentration, 0);
+        const pdf = await generateSampleSheetPDF(data, formula);
         labels.push({
-          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${baseBatch}-MAIN.pdf`,
-          content: mainPdf
+          filename: `IDENTE-PROBE-${fileSafeName(customerName)}-${data.batch}.pdf`,
+          content: pdf,
+          qty
         });
-        console.log(`✅ Label 1/3 generated: ${mainData.profile}`);
-        
-        // ─────────────────────────────────────────────────────────────────────
-        // LABEL 2: First Recommendation
-        // ─────────────────────────────────────────────────────────────────────
-        let rec1Formula;
-        try {
-          if (props._quiz_rec1_formula) {
-            rec1Formula = usableFormula(JSON.parse(props._quiz_rec1_formula)) || generatePersonalizedFormula(quizTags, concentration, 1);
-          } else {
-            rec1Formula = generatePersonalizedFormula(quizTags, concentration, 1);
-          }
-        } catch (e) {
-          rec1Formula = generatePersonalizedFormula(quizTags, concentration, 1);
-        }
-        
-        const rec1Data = {
-          batch: String(parseInt(baseBatch) + 1),
-          name: customerName,
-          date: dateStr,
-          profile: props._quiz_rec1_profile || 'IDENTÉ Custom',
-          concentration,
-          harmonie: String(Math.max(80, parseInt(harmonie) - 2)),
-          match: String(Math.max(80, parseInt(match) - 3))
-        };
-        
-        const rec1Pdf = await generateLabelPDF(rec1Data, rec1Formula);
-        labels.push({
-          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${rec1Data.batch}-REC1.pdf`,
-          content: rec1Pdf
-        });
-        console.log(`✅ Label 2/3 generated: ${rec1Data.profile}`);
-        
-        // ─────────────────────────────────────────────────────────────────────
-        // LABEL 3: Second Recommendation
-        // ─────────────────────────────────────────────────────────────────────
-        let rec2Formula;
-        try {
-          if (props._quiz_rec2_formula) {
-            rec2Formula = usableFormula(JSON.parse(props._quiz_rec2_formula)) || generatePersonalizedFormula(quizTags, concentration, 2);
-          } else {
-            rec2Formula = generatePersonalizedFormula(quizTags, concentration, 2);
-          }
-        } catch (e) {
-          rec2Formula = generatePersonalizedFormula(quizTags, concentration, 2);
-        }
-        
-        const rec2Data = {
-          batch: String(parseInt(baseBatch) + 2),
-          name: customerName,
-          date: dateStr,
-          profile: props._quiz_rec2_profile || 'IDENTÉ Custom',
-          concentration,
-          harmonie: String(Math.max(80, parseInt(harmonie) - 4)),
-          match: String(Math.max(80, parseInt(match) - 5))
-        };
-        
-        const rec2Pdf = await generateLabelPDF(rec2Data, rec2Formula);
-        labels.push({
-          filename: `IDENTE-${customerName.replace(/\s/g, '-')}-${rec2Data.batch}-REC2.pdf`,
-          content: rec2Pdf
-        });
-        console.log(`✅ Label 3/3 generated: ${rec2Data.profile}`);
-        
+        registryEntries.push({ batch: data.batch, data, formula, type, qty });
+        productionNotes.push(`PROBE 2 ml (Batch ${data.batch}): Produktionsblatt im Anhang. Physisches Sample-Etikett: Layout ausstehend (Fläschchen-Maße offen).`);
+
       } else {
-        // ═══════════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════════
         // SINGLE PRODUCT ORDER
-        // ═══════════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════════
         console.log('📝 SINGLE ORDER - Generating 1 label');
-        
+
         const quizData = {
-          batch: props._quiz_batch || String(Date.now()).slice(-8),
-          name: props._quiz_name || order.customer?.first_name || 'Customer',
-          date: props._quiz_date || new Date().toLocaleDateString('de-DE'),
+          batch: baseBatch,
+          name: customerName,
+          date: dateStr,
           profile: props._quiz_profile || 'IDENTÉ Custom',
-          concentration: parseInt(props._quiz_concentration) || 22,
-          harmonie: props._quiz_harmonie || '95',
-          match: props._quiz_match || '92'
+          type: 'single',
+          volume: '50 ml',
+          concentration,
+          harmonie,
+          match
         };
-
-        let quizTags = { positive: [], exclude: [], intensityModifier: 1.0 };
-        try {
-          if (props._quiz_tags) quizTags = JSON.parse(props._quiz_tags);
-        } catch (e) { console.log('⚠️ Could not parse quiz tags'); }
-
-        let formula;
-        if (props._quiz_formula) {
-          try {
-            const usable = usableFormula(JSON.parse(props._quiz_formula));
-            if (usable) {
-              formula = {
-                top: usable.top,
-                heart: usable.heart,
-                base: usable.base,
-                oilTotal: 50 * (quizData.concentration / 100),
-                alcoholTotal: 50 - (50 * (quizData.concentration / 100)),
-                grandTotal: 50
-              };
-            } else {
-              formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
-            }
-          } catch (e) {
-            formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
-          }
-        } else {
-          formula = generatePersonalizedFormula(quizTags, quizData.concentration, 0);
-        }
-
+        if (orderBatches.has(quizData.batch)) throw new Error(`Duplicate batch ${quizData.batch} in order`);
+        orderBatches.add(quizData.batch);
+        const formula = resolveFormula(props._quiz_formula, quizTags, concentration, 0);
         const pdf = await generateLabelPDF(quizData, formula);
         labels.push({
-          filename: `IDENTE-${quizData.name.replace(/\s/g, '-')}-${quizData.batch}.pdf`,
-          content: pdf
+          filename: `IDENTE-${fileSafeName(quizData.name)}-${quizData.batch}.pdf`,
+          content: pdf,
+          qty
         });
+        registryEntries.push({ batch: quizData.batch, data: quizData, formula, type: 'single', qty });
         console.log(`✅ Single label generated: ${quizData.profile}`);
       }
     }
 
     if (labels.length > 0) {
+      // Reserve batches and archive exact artifacts before the irreversible
+      // production-email side effect. Cross-order batch collisions now fail the
+      // webhook instead of silently keeping an unrelated historical snapshot.
+      await persistArtifacts(event, order, labels, registryEntries);
       console.log(`📧 Sending ${labels.length} labels via email`);
-      await sendEmail(order, labels);
+      await sendEmail(order, labels, productionNotes, productionKinds, isIsolatedPreviewRequest(event));
       console.log('✅ Success!');
     } else {
       console.log('⚠️ No labels generated');
@@ -381,18 +510,106 @@ const processWebhook = async (event, context) => {
 //                             where the concurrent attempt ends up failing)
 //   - stale "processing"   -> take over atomically via etag CAS (onlyIfMatch)
 //   - processing failed    -> record is deleted, the next retry runs again
-// If Blobs is unreachable we process WITHOUT dedupe: a duplicate email is
-// recoverable, a silently dropped order is not.
+// In Production, missing/unreachable Blobs fails closed before processing.
+// Local/test contexts may continue without dedupe for deterministic QA.
 
 const LEASE_MS = 10 * 60 * 1000;    // stale takeover after 10 min (fn timeout is far lower)
 const IDEMPOTENCY_STORE = 'webhook-idempotency';
+const PREVIEW_HOST_SUFFIX = '--sprightly-empanada-8e68ab.netlify.app';
+
+function normalizeRequestHost(value) {
+  return String(value || '').split(',')[0].trim().toLowerCase().replace(/:\d+$/, '');
+}
+
+function requestHostSignals(event) {
+  const headers = event && event.headers || {};
+  let rawUrlHost = '';
+  try {
+    rawUrlHost = event?.rawUrl ? new URL(event.rawUrl).hostname.toLowerCase() : '';
+  } catch {
+    rawUrlHost = '';
+  }
+  return [
+    rawUrlHost,
+    normalizeRequestHost(headers.host || headers.Host),
+    normalizeRequestHost(headers['x-forwarded-host'] || headers['X-Forwarded-Host'])
+  ].filter(Boolean);
+}
+
+function hasRequestHostConflict(event) {
+  return new Set(requestHostSignals(event)).size > 1;
+}
+
+function requestHost(event) {
+  const hosts = requestHostSignals(event);
+  return hasRequestHostConflict(event) ? '' : hosts[0] || '';
+}
+
+function requestPreviewToken(event) {
+  const headers = event && event.headers || {};
+  return String(headers['x-idente-preview-token'] || headers['X-Idente-Preview-Token'] || '');
+}
+
+function isPreviewHost(event) {
+  const host = requestHost(event);
+  return host.endsWith(PREVIEW_HOST_SUFFIX) && host !== PREVIEW_HOST_SUFFIX.slice(2);
+}
+
+function isIsolatedPreviewRequest(event) {
+  const configured = String(process.env.IDENTE_E2E_PREVIEW_TOKEN || '');
+  const given = requestPreviewToken(event);
+  if (!isPreviewHost(event)) return false;
+  if (configured.length < 24 || configured.length !== given.length) return false;
+  const configuredBytes = Buffer.from(configured, 'utf8');
+  const givenBytes = Buffer.from(given, 'utf8');
+  if (configuredBytes.length !== givenBytes.length) return false;
+  return crypto.timingSafeEqual(configuredBytes, givenBytes);
+}
+
+// Netlify may deliver the body base64-encoded; HMAC must be computed over the
+// exact raw bytes Shopify signed, and JSON.parse must see the same bytes.
+function getRawBody(event) {
+  if (!event || !event.body) return Buffer.alloc(0);
+  return event.isBase64Encoded ? Buffer.from(event.body, 'base64') : Buffer.from(event.body, 'utf8');
+}
+
+// Shopify webhook HMAC verification is fail-closed. An unsigned compatibility
+// mode would make the public function an email/PDF-production endpoint and is
+// therefore deliberately not available in deployed code.
+function verifyShopifyHmac(event) {
+  const primary = String(process.env.SHOPIFY_WEBHOOK_SECRET || '').trim();
+  if (!primary) return { ok: false, enforced: true, reason: 'missing_secret' };
+  // During a controlled rotation Shopify may still sign with the old secret.
+  // Keep this overlap explicit and temporary; remove PREVIOUS after the new
+  // signing path has been observed and the old credential has been revoked.
+  const previous = String(process.env.SHOPIFY_WEBHOOK_SECRET_PREVIOUS || '').trim();
+  const secrets = [...new Set([primary, previous].filter(Boolean))];
+  const headers = event.headers || {};
+  const given = headers['x-shopify-hmac-sha256'] || headers['X-Shopify-Hmac-Sha256'];
+  if (!given) return { ok: false, enforced: true, reason: 'missing_signature' };
+  const b = Buffer.from(String(given));
+  let ok = false;
+  for (const secret of secrets) {
+    const digest = crypto.createHmac('sha256', secret).update(getRawBody(event)).digest('base64');
+    const a = Buffer.from(digest);
+    if (a.length !== b.length) continue;
+    try {
+      const matches = crypto.timingSafeEqual(a, b);
+      ok = matches || ok;
+    } catch (e) {
+      // Keep checking configured overlap secrets; malformed input remains a
+      // uniform invalid-signature result.
+    }
+  }
+  return { ok, enforced: true, reason: ok ? undefined : 'invalid_signature' };
+}
 
 function idempotencyKey(event) {
   const headers = event.headers || {};
   const id = headers['x-shopify-webhook-id'] || headers['X-Shopify-Webhook-Id'];
   if (id) return 'wh-' + id;
   // No header (e.g. manual replay): fall back to a digest of the payload
-  return 'body-' + crypto.createHash('sha256').update(event.body || '').digest('hex').slice(0, 32);
+  return 'body-' + crypto.createHash('sha256').update(getRawBody(event)).digest('hex').slice(0, 32);
 }
 
 function getIdempotencyStore(event) {
@@ -406,7 +623,7 @@ function getIdempotencyStore(event) {
     // writes (onlyIfNew / onlyIfMatch), which are evaluated atomically at the
     // origin regardless of read consistency - a stale read can only turn a
     // duplicate's response into a 409 retry, never into a second processing.
-    return netlifyBlobs.getStore({ name: IDEMPOTENCY_STORE });
+    return netlifyBlobs.getStore({ name: runtimeStoreName(IDEMPOTENCY_STORE, event) });
   } catch (e) {
     console.log('Idempotency store unavailable, processing without dedupe:', e.message);
     return null;
@@ -434,15 +651,61 @@ async function acquireLease(store, key) {
 }
 
 exports.handler = async (event, context) => {
+  if (hasRequestHostConflict(event)) {
+    return { statusCode: 403, body: JSON.stringify({ error: 'Invalid request host' }) };
+  }
+  const previewRequest = isIsolatedPreviewRequest(event);
+  if ((isPreviewHost(event) || requestPreviewToken(event)) && !previewRequest) {
+    return { statusCode: 403, body: JSON.stringify({ error: 'Invalid preview test target' }) };
+  }
+  if (previewRequest) {
+    try {
+      // A preview must prove all isolation controls before HMAC verification,
+      // lease acquisition, Blob writes, PDF generation or mail assembly.
+      runtimeStoreName(IDEMPOTENCY_STORE, event);
+      mailTransportOptions(true);
+      const from = String(process.env.EMAIL_USER || '').trim();
+      const to = String(process.env.LABEL_EMAIL || from).trim();
+      if (!from || !to) throw new Error('Preview mail envelope is not configured');
+    } catch (error) {
+      console.error('Preview isolation configuration rejected:', error.message);
+      return { statusCode: 503, body: JSON.stringify({ error: 'Preview test isolation is not configured' }) };
+    }
+  }
+  const hmac = verifyShopifyHmac(event);
+  if (!hmac.ok) {
+    if (hmac.reason === 'missing_secret') {
+      return { statusCode: 503, body: JSON.stringify({ error: 'Webhook verification is not configured' }) };
+    }
+    console.log('🚫 Webhook HMAC verification failed - rejecting');
+    return { statusCode: 401, body: JSON.stringify({ error: 'Invalid webhook signature' }) };
+  }
+  // Topic and payment readiness are checked before any idempotency lease. This
+  // makes the endpoint exclusive to orders/paid and prevents a parallel legacy
+  // orders/create subscription (which has a different webhook ID) from causing
+  // a second production email for the same already-paid order.
+  const envelope = validateProductionWebhook(event);
+  if (!envelope.ok) {
+    console.log(`🚫 Production webhook rejected - ${envelope.error}`);
+    return { statusCode: envelope.statusCode, body: JSON.stringify({ error: envelope.error }) };
+  }
   const store = getIdempotencyStore(event);
-  if (!store) return processWebhook(event, context);
+  if (!store) {
+    if (productionPersistenceRequired()) {
+      return { statusCode: 503, body: JSON.stringify({ error: 'Idempotency storage unavailable' }) };
+    }
+    return processWebhook(event, context);
+  }
 
   const key = idempotencyKey(event);
   let state;
   try {
     state = await acquireLease(store, key);
   } catch (e) {
-    console.log('Idempotency check failed, processing without dedupe:', e.message);
+    if (productionPersistenceRequired()) {
+      return { statusCode: 503, body: JSON.stringify({ error: 'Idempotency storage unavailable' }) };
+    }
+    console.log('Idempotency check failed, processing without dedupe in local context:', e.message);
     return processWebhook(event, context);
   }
 
@@ -473,12 +736,38 @@ exports.handler = async (event, context) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function generateQRUrl(data) {
-  const qd = { b: data.batch, n: data.name, d: data.date, c: data.concentration, h: data.harmonie, m: data.match };
-  const json = JSON.stringify(qd);
-  const encoded = encodeURIComponent(json);
-  const replaced = encoded.replace(/%([0-9A-F]{2})/g, (m, p1) => String.fromCharCode(parseInt(p1, 16)));
-  const b64 = Buffer.from(replaced).toString('base64');
-  return 'https://tryidente.com/pages/verify?d=' + b64;
+  const qd = {
+    b: data.batch,
+    n: data.name,
+    d: data.date,
+    c: data.concentration,
+    h: data.harmonie,
+    m: data.match,
+    p: data.profile || undefined,
+    t: data.type || undefined,
+    v: data.volume || undefined
+  };
+  // Base64 must contain the original UTF-8 JSON bytes. The previous
+  // percent-decode + Buffer path encoded non-ASCII bytes twice, which made
+  // names such as "Şule Ünal-Özdemir" appear as mojibake on the verify page.
+  const b64 = Buffer.from(JSON.stringify(qd), 'utf8').toString('base64');
+  return 'https://tryidente.com/pages/verify?d=' + encodeURIComponent(b64);
+}
+
+function productionPersistenceRequired() {
+  return process.env.CONTEXT === 'production' || process.env.IDENTE_REQUIRE_PERSISTENCE === 'true';
+}
+
+function runtimeStoreName(baseName, event) {
+  if (!isIsolatedPreviewRequest(event)) return baseName;
+  const namespace = String(process.env.IDENTE_STORE_NAMESPACE || '').trim();
+  if (!namespace) {
+    throw new Error('A non-production persistence namespace is required');
+  }
+  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(namespace)) {
+    throw new Error('Invalid non-production persistence namespace');
+  }
+  return `${baseName}-${namespace}`;
 }
 
 function getShortProfileName(profile) {
@@ -496,6 +785,10 @@ const WINANSI_EXTRA = String.fromCharCode(
 );
 function sanitizeWinAnsi(str) {
   if (!str) return '';
+  const latinFallback = {
+    'Ł': 'L', 'ł': 'l', 'Đ': 'D', 'đ': 'd', 'Ð': 'D', 'ð': 'd',
+    'Þ': 'Th', 'þ': 'th', 'Æ': 'AE', 'æ': 'ae', 'Ø': 'O', 'ø': 'o'
+  };
   const ok = c => {
     const p = c.codePointAt(0);
     return (p >= 0x20 && p <= 0x7E) || (p >= 0xA0 && p <= 0xFF) || WINANSI_EXTRA.includes(c);
@@ -503,6 +796,7 @@ function sanitizeWinAnsi(str) {
   let out = '';
   for (const c of String(str).normalize('NFC')) {
     if (ok(c)) { out += c; continue; }
+    if (latinFallback[c]) { out += latinFallback[c]; continue; }
     for (const d of c.normalize('NFKD')) {
       if (ok(d)) { out += d; break; }
     }
@@ -510,26 +804,37 @@ function sanitizeWinAnsi(str) {
   return out.replace(/\s+/g, ' ').trim();
 }
 
+function printableLabelName(name) {
+  const printable = sanitizeWinAnsi(name);
+  if (!printable) throw new Error('Customer name cannot be rendered on the production label');
+  return printable;
+}
+
 // Validates a theme-provided formula before it reaches the label: three note
-// arrays, every weight a finite positive number, 3-20 notes total (more than
-// 20 cannot fit the 70mm panel). Returns a normalized copy, or null so the
-// caller falls back to generatePersonalizedFormula instead of printing garbage.
-function usableFormula(f) {
+// arrays, an allow-listed material name, every weight a finite positive number,
+// 3-20 notes total and (when supplied) an oil total matching the declared
+// concentration. Returns a normalized copy or null; callers reject an invalid
+// supplied formula instead of silently changing the customer's production data.
+function usableFormula(f, expectedOilTotal) {
   if (!f || typeof f !== 'object') return null;
   const norm = {};
   let count = 0;
+  let weightTotal = 0;
   for (const key of ['top', 'heart', 'base']) {
     const notes = Array.isArray(f[key]) ? f[key] : [];
     const out = [];
     for (const n of notes) {
       const w = Number(n && n.weight);
-      if (!n || typeof n.name !== 'string' || !n.name.trim() || !isFinite(w) || w <= 0) return null;
-      out.push({ name: n.name, weight: w });
+      const name = canonicalMaterialName(n && n.name);
+      if (!name || !isFinite(w) || w <= 0) return null;
+      out.push({ name, weight: w });
+      weightTotal += w;
       count++;
     }
     norm[key] = out;
   }
   if (count < 3 || count > 20) return null;
+  if (Number.isFinite(expectedOilTotal) && Math.abs(weightTotal - expectedOilTotal) > 0.03) return null;
   return norm;
 }
 
@@ -594,7 +899,7 @@ async function generateLabelPDF(data, formula) {
   const ellipsis = String.fromCharCode(0x2026);
   // Display copies are WinAnsi-sanitized so drawing can never throw; the QR
   // keeps the raw values so the verify page shows the name exactly as entered.
-  const dispName = sanitizeWinAnsi(data.name);
+  const dispName = printableLabelName(data.name);
   const dispBatch = sanitizeWinAnsi(String(data.batch));
   const dispDate = sanitizeWinAnsi(String(data.date));
   const profileName = sanitizeWinAnsi(getShortProfileName(data.profile)).toUpperCase();
@@ -760,36 +1065,270 @@ async function generateLabelPDF(data, formula) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SAMPLE PRODUCTION SHEET (2 ml Probe)
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal A6 production document for 2ml samples. This is deliberately NOT a
+// bottle label: the physical sample label needs the real vial/label dimensions
+// (still unknown) and must not be guessed. The sheet states the formula as
+// percentages of the oil concentrate plus the reference 50ml weights, and
+// leaves the batching decision (concentrate size) to production.
+
+async function generateSampleSheetPDF(data, formula) {
+  console.log(`Generating 2ml sample sheet for ${data.name} - ${data.profile}`);
+
+  const pdfDoc = await PDFDocument.create();
+  const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const courier = await pdfDoc.embedFont(StandardFonts.Courier);
+  const courierBold = await pdfDoc.embedFont(StandardFonts.CourierBold);
+
+  const W = 105 * MM, H = 148 * MM;               // A6 portrait
+  const black = rgb(0, 0, 0);
+  const margin = 8 * MM;
+  const page = pdfDoc.addPage([W, H]);
+
+  const dispName = printableLabelName(data.name);
+  const dispBatch = sanitizeWinAnsi(String(data.batch));
+  const dispDate = sanitizeWinAnsi(String(data.date));
+  const profileName = sanitizeWinAnsi(getShortProfileName(data.profile)).toUpperCase();
+
+  let y = H - margin - 10;
+  drawTracked(page, 'IDENTÉ', { y, size: 16, font: helveticaBold, tracking: 3, x: margin, color: black });
+  y -= 16;
+  page.drawText('PROBE 2 ML — PRODUKTIONSBLATT (INTERN)', { x: margin, y, size: 8, font: helveticaBold, color: black });
+  y -= 18;
+
+  const line = (label, value, bold) => {
+    page.drawText(label, { x: margin, y, size: 7.5, font: courier, color: black });
+    page.drawText(String(value), { x: margin + 90, y, size: 7.5, font: bold ? courierBold : courier, color: black });
+    y -= 11;
+  };
+  line('Kunde', dispName, true);
+  line('Profil', profileName, true);
+  line('Batch', dispBatch, true);
+  line('Datum', dispDate);
+  line('Konzentration', `${data.concentration}% Parfumoel`);
+  line('Fuellmenge', '2 ml');
+  y -= 6;
+
+  // Formula as % of oil (mathematically derived from the 50ml reference)
+  const groups = [
+    { title: 'KOPF', notes: formula.top || [] },
+    { title: 'HERZ', notes: formula.heart || [] },
+    { title: 'BASIS', notes: formula.base || [] }
+  ].filter(g => g.notes.length > 0);
+  const oilTotal = groups.reduce((s, g) => s + g.notes.reduce((a, n) => a + (Number(n.weight) || 0), 0), 0) || 1;
+
+  page.drawText('FORMEL (Anteile am Parfumoel · Referenzgewichte je 50 ml)', { x: margin, y, size: 7, font: helveticaBold, color: black });
+  y -= 12;
+  for (const g of groups) {
+    page.drawText(g.title, { x: margin, y, size: 7, font: courierBold, color: black });
+    y -= 10;
+    for (const n of g.notes) {
+      const w = Number(n.weight) || 0;
+      const pct = (100 * w / oilTotal).toFixed(1);
+      const name = sanitizeWinAnsi(n.name).slice(0, 26);
+      page.drawText(`${name.padEnd(28, '.')} ${pct.padStart(5)}%  ${w.toFixed(2).padStart(6)}g`, { x: margin + 6, y, size: 7, font: courier, color: black });
+      y -= 9.5;
+    }
+    y -= 3;
+  }
+  y -= 4;
+  page.drawText('HINWEIS: Probe aus Konzentrat-Ansatz abfuellen. Referenzgewichte', { x: margin, y, size: 6.5, font: helvetica, color: black });
+  y -= 9;
+  page.drawText('beziehen sich auf den 50-ml-Ansatz und sind NICHT 1:1 fuer 2 ml.', { x: margin, y, size: 6.5, font: helvetica, color: black });
+  y -= 9;
+  page.drawText('Sample-Etikett: Layout ausstehend (Flaeschchen-Masse offen).', { x: margin, y, size: 6.5, font: helveticaBold, color: black });
+
+  try {
+    const qrUrl = generateQRUrl(data);
+    const qrDataUrl = await QRCode.toDataURL(qrUrl, { width: 300, margin: 0, errorCorrectionLevel: 'M', color: { dark: '#000000ff', light: '#ffffffff' } });
+    const qrImage = await pdfDoc.embedPng(Buffer.from(qrDataUrl.replace(/^data:image\/png;base64,/, ''), 'base64'));
+    const qrSide = 42;
+    page.drawImage(qrImage, { x: W - margin - qrSide, y: H - margin - qrSide - 4, width: qrSide, height: qrSide });
+  } catch (e) {
+    console.log('QR failed');
+  }
+
+  return Buffer.from(await pdfDoc.save());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENCE (Netlify Blobs)
+// ═══════════════════════════════════════════════════════════════════════════
+// Two stores, both written before the production email:
+//   labels          order-<n>/<filename>  -> the exact PDF that was emailed
+//   batch-registry  batch-<batch>         -> formula snapshot for reorder/verify
+// onlyIfNew keeps the first snapshot authoritative. Production fails closed on
+// unavailable storage or a cross-order batch collision; local tests may run
+// without Netlify credentials.
+
+const LABELS_STORE = 'labels';
+const REGISTRY_STORE = 'batch-registry';
+
+function formulaDigest(formula) {
+  return crypto.createHash('sha256').update(JSON.stringify(formula)).digest('hex');
+}
+
+function registryRecordMatches(existing, record) {
+  if (!existing) return false;
+  const fields = [
+    'batch', 'order', 'orderId', 'type', 'qty', 'profile', 'volume', 'name',
+    'date', 'concentration', 'formulaHash', 'formulaVersion', 'materialLibraryVersion'
+  ];
+  return fields.every(field => String(existing[field] ?? '') === String(record[field] ?? ''));
+}
+
+async function writeRegistryEntry(registryStore, key, record) {
+  const write = await registryStore.setJSON(key, record, { onlyIfNew: true });
+  if (write && write.modified === false) {
+    const existing = await registryStore.get(key, { type: 'json' });
+    if (!registryRecordMatches(existing, record)) {
+      throw new Error(`Batch collision ${record.batch}`);
+    }
+  }
+}
+
+async function persistArtifacts(event, order, labels, registryEntries) {
+  const required = productionPersistenceRequired();
+  if (!netlifyBlobs) {
+    if (required) throw new Error('Persistence library unavailable');
+    return;
+  }
+  let labelStore = null, registryStore = null;
+  try {
+    if (typeof netlifyBlobs.connectLambda === 'function' && event && event.blobs) {
+      netlifyBlobs.connectLambda(event);
+    }
+    labelStore = netlifyBlobs.getStore({ name: runtimeStoreName(LABELS_STORE, event) });
+    registryStore = netlifyBlobs.getStore({ name: runtimeStoreName(REGISTRY_STORE, event) });
+  } catch (e) {
+    if (required) throw new Error(`Persistence stores unavailable: ${e.message}`);
+    console.log('Persistence stores unavailable in local context, skipping archive:', e.message);
+    return;
+  }
+
+  for (const entry of registryEntries) {
+    const key = `batch-${entry.batch}`;
+    const formulaHash = formulaDigest(entry.formula);
+    const record = {
+      batch: entry.batch,
+      order: order.order_number,
+      orderId: order.id || null,
+      type: entry.type,
+      qty: entry.qty,
+      profile: entry.data.profile,
+      volume: entry.data.volume,
+      name: entry.data.name,
+      date: entry.data.date,
+      concentration: entry.data.concentration,
+      formula: entry.formula,
+      formulaHash,
+      formulaVersion: 'quiz-v6-backend-v2',
+      materialLibraryVersion: 'legacy-60-2026-09',
+      createdAt: new Date().toISOString(),
+      source: 'generate-labels-v2'
+    };
+    try {
+      await writeRegistryEntry(registryStore, key, record);
+    } catch (e) {
+      if (String(e.message).startsWith('Batch collision') || required) throw e;
+      console.log(`Registry unavailable for batch ${entry.batch} in local context:`, e.message);
+    }
+  }
+
+  for (const label of labels) {
+    try {
+      await labelStore.set(`order-${order.order_number}/${label.filename}`, label.content, { onlyIfNew: true });
+    } catch (e) {
+      if (required) throw e;
+      console.log(`Label archive unavailable for ${label.filename} in local context:`, e.message);
+    }
+  }
+  console.log(`🗄️ Archived ${labels.length} PDFs + ${registryEntries.length} registry entries`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // EMAIL
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function sendEmail(order, labels) {
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
-  });
+function escapeHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 
-  const isBundle = labels.length === 3;
-  const subject = isBundle 
-    ? `IDENTE Order #${order.order_number} - TRIO BUNDLE (3 Etiketten)`
-    : `IDENTE Order #${order.order_number} - ${labels.length} Etikett${labels.length > 1 ? 'en' : ''}`;
+function describeProductionKinds(kinds, labelCount) {
+  const unique = [...new Set(kinds || [])];
+  if (unique.length !== 1) return `MIXED ORDER (${labelCount} Dateien)`;
+  if (unique[0] === 'bundle') return 'TRIO BUNDLE (3 Etiketten)';
+  if (unique[0] === 'duo') return 'DUO (2 Etiketten)';
+  if (unique[0] === 'probe') return 'PROBE (2-ml-Produktionsblatt)';
+  return `${labelCount} Etikett${labelCount > 1 ? 'en' : ''}`;
+}
 
-  await transporter.sendMail({
-    from: process.env.EMAIL_USER,
-    to: process.env.LABEL_EMAIL || process.env.EMAIL_USER,
+async function sendEmail(order, labels, productionNotes, productionKinds, previewRequest = false) {
+  const transporter = nodemailer.createTransport(mailTransportOptions(previewRequest));
+  const from = String(process.env.EMAIL_USER || '').trim();
+  const to = String(process.env.LABEL_EMAIL || from).trim();
+  if (!from || !to) throw new Error('Production mail sender/recipient is not configured');
+
+  const notes = productionNotes || [];
+  const uniqueKinds = [...new Set(productionKinds || [])];
+  const isBundle = uniqueKinds.length === 1 && uniqueKinds[0] === 'bundle';
+  const isDuo = uniqueKinds.length === 1 && uniqueKinds[0] === 'duo';
+  const isProbe = uniqueKinds.length === 1 && uniqueKinds[0] === 'probe';
+  const kind = describeProductionKinds(productionKinds, labels.length);
+  const subject = `IDENTE Order #${order.order_number} - ${kind}`;
+
+  const fileList = labels
+    .map(l => `<li>${escapeHtml(l.filename)}${l.qty > 1 ? ` <strong>(× ${l.qty})</strong>` : ''}</li>`)
+    .join('');
+  const noteList = notes.length
+    ? `<p style="color: #9c6626; font-weight: bold;">${notes.map(escapeHtml).join('<br>')}</p>`
+    : '';
+
+  const mailResult = await transporter.sendMail({
+    from,
+    to,
     subject: subject,
     html: `
-      <h2>Neue ${isBundle ? 'TRIO BUNDLE ' : ''}Order!</h2>
-      <p><strong>Order:</strong> #${order.order_number}</p>
-      <p><strong>Kunde:</strong> ${order.customer?.first_name || ''} ${order.customer?.last_name || ''}</p>
+      <h2>Neue ${isBundle ? 'TRIO BUNDLE ' : isDuo ? 'DUO ' : isProbe ? 'PROBE ' : ''}Order!</h2>
+      <p><strong>Order:</strong> #${escapeHtml(order.order_number)}</p>
+      <p><strong>Kunde:</strong> ${escapeHtml(order.customer?.first_name || '')} ${escapeHtml(order.customer?.last_name || '')}</p>
       <p><strong>Etiketten:</strong> ${labels.length}</p>
+      <ul>${fileList}</ul>
+      ${noteList}
       ${isBundle ? '<p style="color: #c5a059; font-weight: bold;">⚠️ TRIO BUNDLE - 3 separate Etiketten im Anhang!</p>' : ''}
       <hr>
       <p style="font-size: 12px; color: #666;">Generiert von IDENTÉ Label System</p>
     `,
-    attachments: labels
+    attachments: labels.map(l => ({ filename: l.filename, content: l.content }))
   });
+  if (previewRequest) {
+    const envelope = mailResult && mailResult.envelope;
+    if (!mailResult || !mailResult.message || !envelope?.from || !envelope?.to?.length) {
+      throw new Error('Preview mail assembly did not produce a complete envelope');
+    }
+  }
+}
+
+function mailTransportOptions(previewRequest = false) {
+  // Deploy previews need a complete pipeline test without sending a synthetic
+  // production email. JSON transport exercises Nodemailer's full message and
+  // attachment assembly locally inside the function. Production can never
+  // opt into this bypass, even if the preview-only flag is copied by mistake.
+  if (previewRequest) {
+    if (process.env.IDENTE_EMAIL_TRANSPORT !== 'json') {
+      throw new Error('Preview mail transport must be isolated JSON');
+    }
+    return { jsonTransport: true };
+  }
+  return {
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+  };
 }
 
 // Exposed for local testing only - not used by the webhook path
-exports._test = { generatePersonalizedFormula, generateLabelPDF, generateQRUrl, sanitizeWinAnsi, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook };
+exports._test = { generatePersonalizedFormula, generateLabelPDF, generateSampleSheetPDF, generateQRUrl, sanitizeWinAnsi, printableLabelName, usableFormula, roundPreservingSum, idempotencyKey, acquireLease, processWebhook, verifyShopifyHmac, offsetBatch, toScoreString, reducedScore, fileSafeName, resolveFormula, escapeHtml, describeProductionKinds, resolveVariantType, parseConcentration, validateBatch, formulaDigest, productionPersistenceRequired, runtimeStoreName, normalizeRequestHost, requestHostSignals, hasRequestHostConflict, requestHost, requestPreviewToken, isPreviewHost, isIsolatedPreviewRequest, canonicalMaterialName, formulaApprovalRequired, approvedFormulaHashes, assertFormulaApproved, registryRecordMatches, writeRegistryEntry, assertProductionReadyOrder, validateProductionWebhook, mailTransportOptions };
